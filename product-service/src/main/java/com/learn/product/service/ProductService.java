@@ -5,6 +5,8 @@ import com.learn.product.dto.ProductResponse;
 import com.learn.product.exception.ProductNotFoundException;
 import com.learn.product.model.Product;
 import com.learn.product.repository.ProductRepository;
+import org.springframework.cache.annotation.CacheEvict;
+import org.springframework.cache.annotation.Cacheable;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
@@ -21,6 +23,7 @@ public class ProductService {
     }
 
     @Transactional
+    @CacheEvict(value = "products", allEntries = true)
     public ProductResponse create(ProductRequest request) {
         Product product = new Product(
                 request.name(), request.description(),
@@ -29,6 +32,7 @@ public class ProductService {
         return toResponse(productRepository.save(product));
     }
 
+    @Cacheable(value = "products", key = "#id")
     public ProductResponse findById(Long id) {
         return productRepository.findById(id)
                 .map(this::toResponse)
@@ -43,6 +47,7 @@ public class ProductService {
     }
 
     @Transactional
+    @CacheEvict(value = "products", key = "#id")
     public ProductResponse update(Long id, ProductRequest request) {
         Product product = productRepository.findById(id)
                 .orElseThrow(() -> new ProductNotFoundException(id));
@@ -55,6 +60,7 @@ public class ProductService {
     }
 
     @Transactional
+    @CacheEvict(value = "products", key = "#id")
     public void delete(Long id) {
         if (!productRepository.existsById(id)) {
             throw new ProductNotFoundException(id);

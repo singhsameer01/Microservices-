@@ -43,10 +43,12 @@ spring:
     bootstrap-servers: localhost:9092
     producer:
       key-serializer: org.apache.kafka.common.serialization.StringSerializer
-      # Events are serialised as JSON; Spring Kafka picks the correct serializer
       value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
-      # Include type information so consumers can deserialise to the correct class
+      acks: all
+      retries: 3
       properties:
+        enable.idempotence: true
+        delivery.timeout.ms: 30000
         spring.json.add.type.headers: true
 
 # ── OpenAPI / Swagger UI ──────────────────────────────────────────────────────
@@ -65,17 +67,31 @@ eureka:
   instance:
     prefer-ip-address: true       # register with IP instead of hostname
 
-# ── Resilience4j circuit breaker — wraps calls to payment-service ─────────────
+# ── Resilience4j — circuit breaker + retry + bulkhead for payment-service ────
 resilience4j:
   circuitbreaker:
     instances:
       payment-service:
         sliding-window-type: COUNT_BASED
-        sliding-window-size: 10         # evaluate the last 10 calls
-        failure-rate-threshold: 50      # open circuit when ≥50% of calls fail
+        sliding-window-size: 10
+        failure-rate-threshold: 50
         wait-duration-in-open-state: 10s
         permitted-number-of-calls-in-half-open-state: 3
-        minimum-number-of-calls: 5      # don't trip until at least 5 calls seen
+        minimum-number-of-calls: 5
+  retry:
+    instances:
+      payment-service:
+        max-attempts: 3
+        wait-duration: 500ms
+        enable-exponential-backoff: true
+        exponential-backoff-multiplier: 2
+        ignore-exceptions:
+          - io.github.resilience4j.bulkhead.BulkheadFullException
+  bulkhead:
+    instances:
+      payment-service:
+        max-concurrent-calls: 10
+        max-wait-duration: 100ms
 
 # ── Enable Feign circuit breaker integration ──────────────────────────────────
 feign:

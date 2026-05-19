@@ -15,6 +15,12 @@ spring:
   application:
     name: api-gateway
 
+  # ── Redis (for rate limiter) ──────────────────────────────────────────────
+  data:
+    redis:
+      host: localhost
+      port: 6379
+
   # ── Spring Cloud Gateway routes ──────────────────────────────────────────
   # Each route matches a path prefix and forwards to the named service via Eureka.
   # lb:// means "load-balanced" — the service name is resolved from the Eureka registry.
@@ -27,7 +33,13 @@ spring:
           uri: lb://user-service
           predicates:
             - Path=/api/v1/auth/**
-          # No JWT filter on auth routes — users need to register/login first
+          filters:
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: 10
+                redis-rate-limiter.burstCapacity: 20
+                redis-rate-limiter.requestedTokens: 1
+                key-resolver: "#{@remoteAddrKeyResolver}"
 
         - id: user-service-users
           uri: lb://user-service

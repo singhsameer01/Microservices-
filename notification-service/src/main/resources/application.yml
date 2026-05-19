@@ -17,16 +17,16 @@ spring:
     bootstrap-servers: localhost:9092
     consumer:
       group-id: notification-service-group
-      # Start from the earliest available offset when first joining a group —
-      # ensures no events are missed on initial startup
       auto-offset-reset: earliest
+      enable-auto-commit: false
       key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
       value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
       properties:
-        spring.json.trusted.packages: "com.learn.*"
-        # Map the producer's fully-qualified class names (sent in __TypeId__ header)
-        # to the local event record classes in this service's classpath
+        # Narrowed to only local event classes — prevents deserialization of arbitrary types
+        spring.json.trusted.packages: "com.learn.notification.event"
         spring.json.type.mapping: "com.learn.order.event.OrderPlacedEvent:com.learn.notification.event.OrderPlacedEvent,com.learn.payment.event.PaymentProcessedEvent:com.learn.notification.event.PaymentProcessedEvent"
+    listener:
+      ack-mode: manual_immediate
 
 # ── Eureka service discovery ──────────────────────────────────────────────────
 eureka:

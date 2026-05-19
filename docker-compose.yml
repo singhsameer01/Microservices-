@@ -111,6 +111,18 @@ services:
     depends_on:
       - prometheus
 
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    networks: [ecommerce-net]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   # ────────────────────────────────────────────────────────────────────────────
   # Microservices
   # Each service requires a Dockerfile in its directory.
@@ -146,8 +158,12 @@ services:
       SPRING_PROFILES_ACTIVE: docker
       EUREKA_CLIENT_SERVICE_URL_DEFAULTZONE: http://eureka-server:8761/eureka/
       MANAGEMENT_ZIPKIN_TRACING_ENDPOINT: http://zipkin:9411/api/v2/spans
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: 6379
     depends_on:
       eureka-server:
+        condition: service_healthy
+      redis:
         condition: service_healthy
 
   user-service:
@@ -178,8 +194,12 @@ services:
       SPRING_PROFILES_ACTIVE: docker
       EUREKA_CLIENT_SERVICE_URL_DEFAULTZONE: http://eureka-server:8761/eureka/
       MANAGEMENT_ZIPKIN_TRACING_ENDPOINT: http://zipkin:9411/api/v2/spans
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: 6379
     depends_on:
       eureka-server:
+        condition: service_healthy
+      redis:
         condition: service_healthy
 
   order-service:

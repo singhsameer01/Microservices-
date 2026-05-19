@@ -34,7 +34,8 @@ springdoc:
     path: /swagger-ui.html
 
 jwt:
-  expiration: 86400000
+  expiration: 900000                  # 15 minutes — use refresh token to re-issue
+  refresh-token-expiration-days: 7
 
 eureka:
   client:

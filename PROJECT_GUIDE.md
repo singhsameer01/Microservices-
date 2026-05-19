@@ -41,17 +41,19 @@ A production-grade e-commerce backend built as a learning project. Seven indepen
 | Authentication | RSA-signed JWT via Spring OAuth2 Resource Server + Nimbus JOSE | — |
 | Messaging | Apache Kafka (Confluent) | 7.5.0 |
 | Service-to-Service | Spring Cloud OpenFeign | 4.1.0 |
-| Resilience | Resilience4j (circuit breaker) | — |
+| Resilience | Resilience4j (circuit breaker + retry + bulkhead) | — |
 | Distributed Tracing | Micrometer Tracing + Brave + Zipkin Reporter | — |
 | Metrics | Micrometer Prometheus Registry | — |
 | Metrics Dashboard | Grafana | — |
 | Persistence | Spring Data JPA + H2 (in-memory, all services) | — |
+| Cache | Redis 7 (product-service) | — |
+| Rate Limiting | Spring Cloud Gateway RequestRateLimiter + Redis | — |
 | API Documentation | Springdoc OpenAPI / Swagger UI | 2.3.0 |
 | Build Tool | Maven (each service is an independent module) | 3.8+ |
 | Containerization | Docker (multi-stage builds) | — |
 | Orchestration | Kubernetes | — |
 | CI/CD | GitHub Actions | — |
-| Structured Logging | logstash-logback-encoder (notification-service) | 7.4 |
+| Structured Logging | logstash-logback-encoder (all 7 services) | 7.4 |
 
 ---
 
@@ -70,7 +72,8 @@ A production-grade e-commerce backend built as a learning project. Seven indepen
 │  • JWKS fetched from user-service /.well-known/jwks.json            │
 │  • Routes by path prefix using lb:// (Eureka load-balanced URIs)   │
 │  • Global CORS configuration                                        │
-│  • /api/v1/auth/**  →  permitted (no auth)                          │
+│  • Rate limiting on /api/v1/auth/** (10 req/s per IP via Redis)    │
+│  • /api/v1/auth/**  →  permitted (no auth), rate limited           │
 │  • Everything else  →  requires valid JWT                           │
 └──┬──────────┬─────────────┬──────────────┬───────────────────────────┘
    │          │             │              │
@@ -79,13 +82,16 @@ user-      product-      order-        payment-
 service    service       service       service
 :8081      :8082         :8083         :8084
            (JWT val.)    (JWT val.)    (JWT val.)
+           (Redis cache)
 
                        order-service
                        ┌─────────────────────────────────────────┐
                        │  OpenFeign ──────────► product-service  │
                        │  OpenFeign ──────────► payment-service  │
-                       │   (+ @CircuitBreaker on payment call)   │
-                       │  Kafka producer ─────► order-placed     │
+                       │   (+ @CircuitBreaker + @Retry           │
+                       │      + @Bulkhead on payment call)       │
+                       │  Outbox table ───────► Kafka scheduler  │
+                       │    scheduler ────────► order-placed     │
                        └─────────────────────────────────────────┘
 
                        payment-service
@@ -100,6 +106,7 @@ service    service       service       service
                        ┌─────────────────────────────────────────┐
                        │  Kafka consumer ◄──── order-placed      │
                        │  Kafka consumer ◄──── payment-processed │
+                       │  Manual ack + DLT (3 retries)           │
                        │  MDC correlation + structured JSON logs  │
                        └─────────────────────────────────────────┘
 
@@ -109,10 +116,11 @@ service    service       service       service
 └─────────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────────┐
-│                       Observability                                  │
-│  All services ──────────────────────────► Zipkin :9411 (tracing)   │
-│  All services /actuator/prometheus ─────► Prometheus :9090         │
-│                                          Grafana :3000              │
+│                    Infrastructure                                    │
+│  Redis :6379    — rate limiter (gateway) + product cache           │
+│  Kafka :9092    — async event bus                                   │
+│  Zipkin :9411   — distributed tracing                              │
+│  Prometheus :9090 + Grafana :3000  — metrics                       │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -131,6 +139,7 @@ service    service       service       service
 | notification-service | 8085 | (no REST API — Kafka consumer only) |
 | Apache Kafka (host) | 9092 | — |
 | Apache Kafka (internal Docker) | 29092 | — |
+| Redis | 6379 | — |
 | Zipkin | 9411 | http://localhost:9411 |
 | Prometheus | 9090 | http://localhost:9090 |
 | Grafana | 3000 | http://localhost:3000 (admin / admin) |
@@ -168,7 +177,7 @@ cd microservices-ecommerce
 
 **Step 2 — Start infrastructure containers**
 ```bash
-docker-compose up -d zookeeper kafka zipkin prometheus grafana
+docker-compose up -d zookeeper kafka zipkin redis prometheus grafana
 ```
 Wait ~20 seconds for Kafka to fully initialize before starting any service.
 
@@ -259,6 +268,7 @@ docker-compose logs -f order-service
 | Zipkin | http://localhost:9411 | Zipkin UI loads |
 | Prometheus | http://localhost:9090 | Prometheus UI loads |
 | Grafana | http://localhost:3000 | Grafana login (admin/admin) |
+| Redis | `redis-cli -p 6379 ping` → `PONG` | Redis running |
 | H2 Console (user-service) | http://localhost:8081/h2-console | Login with `sa`, empty password |
 
 ---
@@ -319,6 +329,17 @@ Authorization: Bearer <token>
 - `product-service` also validates the JWT independently (defense in depth).
 - Returns a paginated list of products.
 
+### Step 3b — (Every 15 min) Refresh the Access Token
+
+```
+POST http://localhost:8080/api/v1/auth/refresh
+Body: { "refreshToken": "<refresh-token-from-login>" }
+```
+
+- Returns a new access token (15 min) and rotates the refresh token.
+- The old refresh token is revoked.
+- To log out: `POST /api/v1/auth/logout` with the refresh token body.
+
 ### Step 4 — Place an Order
 
 ```
@@ -335,10 +356,13 @@ Inside `order-service.OrderService.placeOrder()`:
 1. **Validate products** — for each order item, calls `ProductClient` (OpenFeign → `GET /api/v1/products/{id}` on product-service). The Bearer token is relayed via `FeignConfig.RequestInterceptor`. If a product is not found, an exception is thrown.
 2. **Calculate total** — uses actual price from product-service response (not from the client request).
 3. **Save order as PENDING** — `Order` entity with status `PENDING` is saved to H2.
-4. **Initiate payment** — delegates to `PaymentProcessor.processPayment()` which is annotated with `@CircuitBreaker(name="payment-service")`. This calls `PaymentClient` (OpenFeign → `POST /api/v1/payments` on payment-service).
-5. **If circuit is OPEN** (payment-service unhealthy) — `paymentFallback()` runs: sets order status to `CANCELLED`, saves, throws exception.
-6. **If payment succeeds** — order status is set to `CONFIRMED`.
-7. **Publish Kafka event** — `OrderEventPublisher` sends an `OrderPlacedEvent` to topic `order-placed` with orderId as the message key (guarantees same-partition delivery for the same order).
+4. **Initiate payment** — delegates to `PaymentProcessor.processPayment()` which is annotated with `@CircuitBreaker + @Retry + @Bulkhead`. Calls `PaymentClient` (OpenFeign → `POST /api/v1/payments`).
+5. **If bulkhead full** — rejects immediately; fallback sets order to `CANCELLED`.
+6. **If transient failure** — retry up to 3 times with exponential backoff (500ms, 1s, 2s).
+7. **If circuit is OPEN** — `paymentFallback()` runs: sets order status to `CANCELLED`.
+8. **If payment succeeds** — order status is set to `CONFIRMED`.
+9. **Save to outbox** — an `OutboxEvent` is saved to the `outbox_events` table **in the same DB transaction** as the order. This is the outbox pattern — no dual-write risk.
+10. **Async Kafka publish** — `OutboxEventPublisher` (@Scheduled, every 5s) picks up unpublished outbox events and sends them to Kafka topic `order-placed`, then marks them published.
 
 ### Step 5 — Payment Processing (Async via Kafka)
 
@@ -394,6 +418,25 @@ Token claims: sub=username, role, iss="user-service", exp=now+24h
 
 **Important**: The RSA key pair is generated fresh on every `user-service` restart. All existing tokens become invalid after a restart.
 
+### Refresh Token Flow
+
+```
+POST /api/v1/auth/login
+  → returns: { token (15 min), refreshToken (7 days), username, role }
+
+POST /api/v1/auth/refresh  { refreshToken: "..." }
+  → validates refresh token in DB (not revoked, not expired)
+  → issues new access token + rotates refresh token (old one revoked)
+  → returns: { token (15 min), refreshToken (7 days), username, role }
+
+POST /api/v1/auth/logout   { refreshToken: "..." }
+  → marks refresh token as revoked in DB
+  → access token expires naturally (max 15 min)
+  → returns: 204 No Content
+```
+
+Refresh tokens are stored in the `refresh_tokens` DB table. Each login revokes all previous refresh tokens for that user (single-session semantics).
+
 ### Token Relay (Service-to-Service)
 
 When `order-service` calls `product-service` or `payment-service` via OpenFeign, it must pass the original user's JWT downstream. This is done by `FeignConfig.java`:
@@ -414,18 +457,20 @@ public RequestInterceptor requestInterceptor() {
 
 ### Route Security Matrix
 
-| Route Pattern | JWT Required? | Service |
-|---|---|---|
-| `POST /api/v1/auth/register` | No | user-service |
-| `POST /api/v1/auth/login` | No | user-service |
-| `GET /.well-known/jwks.json` | No | user-service |
-| `/actuator/**` | No | all services |
-| `/h2-console/**` | No | all services (local dev) |
-| `/swagger-ui/**`, `/api-docs/**` | No | all services |
-| `/api/v1/users/**` | Yes | user-service |
-| `/api/v1/products/**` | Yes | product-service (gateway + service-level) |
-| `/api/v1/orders/**` | Yes | order-service (gateway + service-level) |
-| `/api/v1/payments/**` | Yes | payment-service (gateway + service-level) |
+| Route Pattern | JWT Required? | Rate Limited? | Service |
+|---|---|---|---|
+| `POST /api/v1/auth/register` | No | Yes (10/s per IP) | user-service |
+| `POST /api/v1/auth/login` | No | Yes (10/s per IP) | user-service |
+| `POST /api/v1/auth/refresh` | No | Yes (10/s per IP) | user-service |
+| `POST /api/v1/auth/logout` | No | Yes (10/s per IP) | user-service |
+| `GET /.well-known/jwks.json` | No | No | user-service |
+| `/actuator/**` | No | No | all services |
+| `/h2-console/**` | No | No | all services (local dev) |
+| `/swagger-ui/**`, `/api-docs/**` | No | No | all services |
+| `/api/v1/users/**` | Yes | No | user-service |
+| `/api/v1/products/**` | Yes | No | product-service (gateway + service-level) |
+| `/api/v1/orders/**` | Yes | No | order-service (gateway + service-level) |
+| `/api/v1/payments/**` | Yes | No | payment-service (gateway + service-level) |
 
 Security is enforced at **both the gateway and individual service level** (defense in depth). Each of `product-service`, `order-service`, and `payment-service` validates the JWT independently using the same JWKS URI. Token relay in `FeignConfig` ensures the user's Bearer token is forwarded on all Feign calls between services.
 
@@ -482,7 +527,7 @@ spring:
 1. Fetches the JWKS from `http://localhost:8081/.well-known/jwks.json`
 2. Caches the public key
 3. Validates every incoming JWT's signature, expiry, and issuer
-4. Rejects requests with missing or invalid tokens with 401
+4. Rejects requests with missing or invalid tokens with 401n
 
 **Dependencies**: `spring-cloud-starter-gateway`, `spring-cloud-starter-netflix-eureka-client`, `spring-boot-starter-oauth2-resource-server`
 
@@ -608,6 +653,8 @@ spring:
 
 **Notable patterns**:
 - Circuit breaker is on `PaymentProcessor` (not `OrderService`) — Spring AOP proxies only work across bean boundaries
+- `PaymentProcessor` stacks `@CircuitBreaker + @Retry + @Bulkhead` — bulkhead limits concurrency, retry handles transient failures, circuit breaker prevents cascading failures
+- **Outbox pattern**: `OrderService.placeOrder()` saves an `OutboxEvent` to the DB in the same transaction as the Order. `OutboxEventPublisher` (@Scheduled every 5s) reads unpublished events and sends to Kafka — eliminates the dual-write race condition
 - `orderId` as Kafka message key — guarantees all events for the same order land on the same partition (ordering guarantee)
 - Token relay via `FeignConfig.RequestInterceptor` — forwards user's Bearer token to downstream services
 
@@ -719,7 +766,19 @@ payment-service KafkaConfig:
 
 Non-retryable exceptions (go directly to DLT, no retries):
   - PaymentAlreadyExistsException
+
+notification-service KafkaConfig:
+  ack-mode: MANUAL_IMMEDIATE
+  retries: 3
+  backoff: 1 second fixed
+  on failure after 3 retries → send to {topic}.DLT
+  (order-placed.DLT, payment-processed.DLT)
 ```
+
+**Kafka producer hardening** (order-service and payment-service):
+- `acks: all` — wait for full replication before confirming
+- `enable.idempotence: true` — exactly-once at producer level (no duplicate messages on retry)
+- `retries: 3` — automatic producer retry on transient failures
 
 ### Consumer Groups
 
@@ -730,9 +789,11 @@ Non-retryable exceptions (go directly to DLT, no retries):
 
 ## 9. Resilience Patterns
 
-### Circuit Breaker: order-service → payment-service
+### Circuit Breaker + Retry + Bulkhead: order-service → payment-service
 
 Location: `order-service/service/PaymentProcessor.java`
+
+All three decorators stack on `processPayment()`. Execution order (outermost → innermost): CircuitBreaker → Retry → Bulkhead → actual Feign call.
 
 ```yaml
 resilience4j:
@@ -740,13 +801,27 @@ resilience4j:
     instances:
       payment-service:
         sliding-window-type: COUNT_BASED
-        sliding-window-size: 10        # Track last 10 calls
-        failure-rate-threshold: 50     # Open circuit if ≥50% fail
-        minimum-number-of-calls: 5     # Need ≥5 calls before evaluating
+        sliding-window-size: 10
+        failure-rate-threshold: 50
+        minimum-number-of-calls: 5
         wait-duration-in-open-state: 10s
+  retry:
+    instances:
+      payment-service:
+        max-attempts: 3
+        wait-duration: 500ms
+        enable-exponential-backoff: true
+        exponential-backoff-multiplier: 2
+        ignore-exceptions:
+          - io.github.resilience4j.bulkhead.BulkheadFullException
+  bulkhead:
+    instances:
+      payment-service:
+        max-concurrent-calls: 10
+        max-wait-duration: 100ms
 ```
 
-**Fallback behavior**: When the circuit is open, `paymentFallback()` is called — it sets the order status to `CANCELLED` and saves it to the DB.
+**Fallback behavior**: Any exception (circuit open, retry exhausted, bulkhead full) triggers `paymentFallback()` — sets order status to `CANCELLED`.
 
 ### Circuit Breaker: payment-service → Bank Gateway
 
@@ -762,6 +837,26 @@ resilience4j:
         minimum-number-of-calls: 3
         wait-duration-in-open-state: 15s
 ```
+
+### Outbox Pattern: order-service → Kafka
+
+The outbox pattern solves the dual-write problem between saving the order and publishing the Kafka event.
+
+**Problem**: If `orderRepository.save()` succeeds but `kafkaTemplate.send()` fails (e.g., Kafka is briefly down), the order exists but no event is ever published — payment and notification never happen.
+
+**Solution**:
+```
+placeOrder() @Transactional:
+  orderRepository.save(order)         ← DB write #1
+  outboxEventRepository.save(event)   ← DB write #2 — SAME transaction
+
+OutboxEventPublisher @Scheduled(5s):
+  SELECT * FROM outbox_events WHERE published = false
+  kafkaTemplate.send(...).get(5s)     ← Kafka write (retried on next poll if failed)
+  event.published = true              ← marked only after Kafka confirms
+```
+
+Both DB writes are atomic. If the service crashes between saving the order and the scheduler running, the scheduler picks up the unpublished event on next poll.
 
 ### Feign Circuit Breaker
 
@@ -823,7 +918,45 @@ GET /actuator/info            → build info
 
 ---
 
-## 11. CI/CD Pipeline
+## 11. Caching
+
+### Product Cache (Redis, product-service)
+
+Individual product lookups (`GET /api/v1/products/{id}`) are cached in Redis for 5 minutes.
+
+```java
+@Cacheable(value = "products", key = "#id")
+public ProductResponse findById(Long id) { ... }
+
+@CacheEvict(value = "products", key = "#id")
+public ProductResponse update(Long id, ...) { ... }
+
+@CacheEvict(value = "products", key = "#id")
+public void delete(Long id) { ... }
+```
+
+`create()` uses `allEntries = true` eviction since a new product doesn't have a known ID pre-save.
+
+Cache is configured in `CacheConfig.java` with a 5-minute TTL using `GenericJackson2JsonRedisSerializer` (handles Java records).
+
+### Rate Limiting (Redis, api-gateway)
+
+Auth endpoints are rate-limited at 10 requests/second per IP (burst of 20) using Spring Cloud Gateway's `RequestRateLimiter` filter backed by Redis.
+
+```yaml
+filters:
+  - name: RequestRateLimiter
+    args:
+      redis-rate-limiter.replenishRate: 10
+      redis-rate-limiter.burstCapacity: 20
+      key-resolver: "#{@remoteAddrKeyResolver}"
+```
+
+A 429 Too Many Requests response is returned when the limit is exceeded.
+
+---
+
+## 12. CI/CD Pipeline
 
 File: `.github/workflows/ci-cd.yml`
 
@@ -873,7 +1006,7 @@ Required GitHub secrets:
 
 ---
 
-## 12. Kubernetes Deployment
+## 13. Kubernetes Deployment
 
 Manifests are in `k8s/` — one file per service, plus a shared `configmap.yml`.
 
@@ -938,22 +1071,30 @@ spec:
 
 ---
 
-## 13. Quick Reference: Key Files
+## 14. Quick Reference: Key Files
 
 | File | Purpose |
 |---|---|
 | `CLAUDE.md` | Build commands and architecture summary |
 | `HINTS.md` | Implementation hints and code snippets per service |
-| `docker-compose.yml` | Infrastructure + service orchestration |
+| `docker-compose.yml` | Infrastructure + service orchestration (includes Redis) |
 | `config/prometheus.yml` | Prometheus scrape config for all services |
 | `.github/workflows/ci-cd.yml` | Full CI/CD pipeline |
 | `k8s/configmap.yml` | Shared Kubernetes config and secrets |
 | `k8s/order-service.yml` | Example HPA configuration |
 | `user-service/.../RsaKeyConfig.java` | RSA key pair generation |
 | `user-service/.../JwksController.java` | Public key JWKS endpoint |
+| `user-service/.../RefreshTokenService.java` | Refresh token lifecycle (create, validate, revoke) |
+| `user-service/.../AuthController.java` | Auth endpoints including /refresh and /logout |
+| `order-service/.../OutboxEvent.java` | Outbox pattern entity |
+| `order-service/.../OutboxEventPublisher.java` | Scheduled Kafka publisher from outbox table |
+| `order-service/.../OrderService.java` | Saves to outbox instead of direct Kafka publish |
 | `order-service/.../FeignConfig.java` | Token relay and error decoder |
-| `order-service/.../PaymentProcessor.java` | Circuit breaker pattern (must be separate bean) |
+| `order-service/.../PaymentProcessor.java` | CircuitBreaker + Retry + Bulkhead (must be separate bean) |
 | `payment-service/.../KafkaConfig.java` | DLT and retry error handler |
 | `payment-service/.../OrderPlacedConsumer.java` | Idempotent Kafka consumer |
-| `notification-service/.../NotificationConsumer.java` | MDC log correlation |
-| `notification-service/.../logback-spring.xml` | Structured JSON logging config |
+| `product-service/.../CacheConfig.java` | Redis cache manager, 5 min TTL |
+| `product-service/.../ProductService.java` | @Cacheable product lookups |
+| `api-gateway/.../RateLimiterConfig.java` | IP-based KeyResolver for rate limiter |
+| `notification-service/.../KafkaConfig.java` | DLT + manual ack for notification consumers |
+| `notification-service/.../logback-spring.xml` | Structured JSON logging config (template for all services) |

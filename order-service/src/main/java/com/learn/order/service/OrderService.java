@@ -1,12 +1,15 @@
 package com.learn.order.service;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.learn.order.client.ProductClient;
 import com.learn.order.dto.*;
 import com.learn.order.event.OrderPlacedEvent;
 import com.learn.order.exception.OrderNotFoundException;
-import com.learn.order.messaging.OrderEventPublisher;
 import com.learn.order.model.Order;
 import com.learn.order.model.OrderItem;
+import com.learn.order.outbox.OutboxEvent;
+import com.learn.order.outbox.OutboxEventRepository;
 import com.learn.order.repository.OrderRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -21,17 +24,13 @@ import java.util.List;
 /**
  * Core business logic for order management.
  *
- * <p>The order placement flow:
- * <ol>
- *   <li>Validate each requested product via Feign → product-service (ProductClient)</li>
- *   <li>Save the order as PENDING in the local H2 database</li>
- *   <li>Initiate payment via Feign → payment-service (PaymentClient), wrapped in a
- *       Resilience4j circuit breaker; if the circuit is OPEN or payment fails the order
- *       is marked CANCELLED via the fallback</li>
- *   <li>Publish an {@link OrderPlacedEvent} to the "order-placed" Kafka topic so
- *       notification-service can send a confirmation</li>
- * </ol>
- * </p>
+ * Order placement flow:
+ * 1. Validate products via Feign → product-service
+ * 2. Save order as PENDING
+ * 3. Initiate payment via Feign → payment-service (circuit-breaker + bulkhead + retry wrapped)
+ * 4. Save OrderPlacedEvent to outbox_events table in the same DB transaction.
+ *    OutboxEventPublisher polls unpublished events and sends them to Kafka every 5 seconds,
+ *    guaranteeing delivery even if the service crashes between steps 3 and 4.
  */
 @Service
 @Transactional(readOnly = true)
@@ -42,41 +41,33 @@ public class OrderService {
     private final OrderRepository orderRepository;
     private final ProductClient productClient;
     private final PaymentProcessor paymentProcessor;
-    private final OrderEventPublisher eventPublisher;
+    private final OutboxEventRepository outboxEventRepository;
+    private final ObjectMapper objectMapper;
 
     public OrderService(
             OrderRepository orderRepository,
             ProductClient productClient,
             PaymentProcessor paymentProcessor,
-            OrderEventPublisher eventPublisher) {
+            OutboxEventRepository outboxEventRepository,
+            ObjectMapper objectMapper) {
         this.orderRepository = orderRepository;
         this.productClient = productClient;
         this.paymentProcessor = paymentProcessor;
-        this.eventPublisher = eventPublisher;
+        this.outboxEventRepository = outboxEventRepository;
+        this.objectMapper = objectMapper;
     }
 
-    /**
-     * Places a new order for a customer.
-     *
-     * <p>Validates each product against product-service (real name and price are fetched),
-     * saves the order, calls payment-service through a circuit breaker, and publishes
-     * an OrderPlacedEvent to Kafka on success.</p>
-     *
-     * @param request validated order payload (customerId + list of items)
-     * @return the saved order with confirmed total amount and status
-     */
     @Transactional
     public OrderResponse placeOrder(OrderRequest request) {
         Order order = new Order(request.customerId());
 
         for (OrderItemDto itemDto : request.items()) {
-            // Validate product exists and get real name/price from product-service
             ProductResponse product = productClient.getProductById(itemDto.productId());
             OrderItem item = new OrderItem(
                     product.id(),
                     product.name(),
                     itemDto.quantity(),
-                    product.price()          // use authoritative price from product-service
+                    product.price()
             );
             order.addItem(item);
         }
@@ -84,18 +75,22 @@ public class OrderService {
         Order saved = orderRepository.save(order);
         log.info("Order saved with id={} status=PENDING for customerId={}", saved.getId(), saved.getCustomerId());
 
-        // Delegate to PaymentProcessor — a separate bean so Spring AOP proxy intercepts @CircuitBreaker
         paymentProcessor.processPayment(saved);
 
-        // Publish event regardless of payment status — notification-service reacts to it
-        eventPublisher.publishOrderPlaced(new OrderPlacedEvent(
-                saved.getId(),
-                saved.getCustomerId(),
-                saved.getTotalAmount(),
-                Instant.now()
-        ));
+        saveToOutbox(saved);
 
         return toResponse(saved);
+    }
+
+    private void saveToOutbox(Order order) {
+        try {
+            OrderPlacedEvent event = new OrderPlacedEvent(
+                    order.getId(), order.getCustomerId(), order.getTotalAmount(), Instant.now());
+            String payload = objectMapper.writeValueAsString(event);
+            outboxEventRepository.save(new OutboxEvent("ORDER", order.getId(), "ORDER_PLACED", payload));
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("Failed to serialize OrderPlacedEvent for order " + order.getId(), e);
+        }
     }
 
     /**

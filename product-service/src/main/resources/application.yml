@@ -18,6 +18,14 @@ spring:
         jwt:
           jwk-set-uri: http://localhost:8081/.well-known/jwks.json
 
+  # ── Redis cache (product lookups cached for 5 min) ────────────────────────
+  data:
+    redis:
+      host: localhost
+      port: 6379
+  cache:
+    type: redis
+
   # ── H2 in-memory database ─────────────────────────────────────────────────
   datasource:
     url: jdbc:h2:mem:productdb;DB_CLOSE_DELAY=-1
