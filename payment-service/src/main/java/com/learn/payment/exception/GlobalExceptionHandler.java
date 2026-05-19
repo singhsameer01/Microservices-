@@ -20,8 +20,8 @@ public class GlobalExceptionHandler {
                 .body(new ErrorResponse(404, ex.getMessage(), LocalDateTime.now()));
     }
 
-    @ExceptionHandler(IllegalStateException.class)
-    public ResponseEntity<ErrorResponse> handleConflict(IllegalStateException ex) {
+    @ExceptionHandler(PaymentAlreadyExistsException.class)
+    public ResponseEntity<ErrorResponse> handleConflict(PaymentAlreadyExistsException ex) {
         return ResponseEntity.status(HttpStatus.CONFLICT)
                 .body(new ErrorResponse(409, ex.getMessage(), LocalDateTime.now()));
     }

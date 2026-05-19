@@ -1,2 +1,108 @@
-# Write your configuration here.
-# See api-gateway/README.md for a plain-English explanation of every setting.
+# ─────────────────────────────────────────────────────────────────────────────
+# api-gateway — application.yml
+#
+# Single entry point for all client traffic. Validates JWT tokens and routes
+# requests to downstream microservices discovered via Eureka.
+#
+# IMPORTANT: this service uses Spring Cloud Gateway (WebFlux). Do NOT add
+# spring-boot-starter-web — it conflicts with the reactive stack.
+# ─────────────────────────────────────────────────────────────────────────────
+
+server:
+  port: 8080
+
+spring:
+  application:
+    name: api-gateway
+
+  # ── Spring Cloud Gateway routes ──────────────────────────────────────────
+  # Each route matches a path prefix and forwards to the named service via Eureka.
+  # lb:// means "load-balanced" — the service name is resolved from the Eureka registry.
+  cloud:
+    gateway:
+      routes:
+
+        # ── user-service: auth (public) + user management (protected) ───────
+        - id: user-service-auth
+          uri: lb://user-service
+          predicates:
+            - Path=/api/v1/auth/**
+          # No JWT filter on auth routes — users need to register/login first
+
+        - id: user-service-users
+          uri: lb://user-service
+          predicates:
+            - Path=/api/v1/users/**
+
+        # ── product-service ──────────────────────────────────────────────────
+        - id: product-service
+          uri: lb://product-service
+          predicates:
+            - Path=/api/v1/products/**
+
+        # ── order-service ────────────────────────────────────────────────────
+        - id: order-service
+          uri: lb://order-service
+          predicates:
+            - Path=/api/v1/orders/**
+
+        # ── payment-service ──────────────────────────────────────────────────
+        - id: payment-service
+          uri: lb://payment-service
+          predicates:
+            - Path=/api/v1/payments/**
+
+      # Default CORS configuration — adjust allowed origins for production
+      globalcors:
+        cors-configurations:
+          '[/**]':
+            allowedOrigins: "*"
+            allowedMethods:
+              - GET
+              - POST
+              - PUT
+              - DELETE
+              - OPTIONS
+            allowedHeaders: "*"
+
+  # ── SSO: OAuth2 Resource Server ─────────────────────────────────────────────
+  # Fetches user-service's public RSA key to validate tokens.
+  # No shared secret — all services trust user-service's JWKS endpoint.
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          jwk-set-uri: http://localhost:8081/.well-known/jwks.json
+
+# ── Eureka service discovery ──────────────────────────────────────────────────
+eureka:
+  client:
+    service-url:
+      # All lb:// URIs are resolved against this registry
+      defaultZone: http://localhost:8761/eureka/
+  instance:
+    prefer-ip-address: true
+
+# ── Distributed tracing ───────────────────────────────────────────────────────
+management:
+  tracing:
+    sampling:
+      probability: 1.0
+  zipkin:
+    tracing:
+      endpoint: http://localhost:9411/api/v2/spans
+
+  endpoints:
+    web:
+      exposure:
+        include: health, info, metrics, prometheus
+  endpoint:
+    health:
+      show-details: always
+      probes:
+        enabled: true
+
+logging:
+  level:
+    com.learn.gateway: DEBUG
+    org.springframework.cloud.gateway: DEBUG

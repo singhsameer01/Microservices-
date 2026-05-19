@@ -1,2 +1,83 @@
-# Write your Kubernetes manifests here.
-# See README.md in the project root (k8s section) for a plain-English explanation of every field.
+# ─────────────────────────────────────────────────────────────────────────────
+# eureka-server — Kubernetes Deployment + Service
+#
+# Single-replica service registry. All other services point their Eureka client
+# to http://eureka-server:8761/eureka/ (the ClusterIP DNS name).
+# ─────────────────────────────────────────────────────────────────────────────
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: eureka-server
+  labels:
+    app: eureka-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: eureka-server
+  template:
+    metadata:
+      labels:
+        app: eureka-server
+    spec:
+      containers:
+        - name: eureka-server
+          image: sameerks/eureka-server:latest
+          ports:
+            - containerPort: 8761
+
+          # Liveness probe: Kubernetes restarts the pod if this keeps failing.
+          # /actuator/health/liveness is exposed by Spring Boot Actuator when
+          # management.endpoint.health.probes.enabled=true.
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: 8761
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            failureThreshold: 3
+
+          # Readiness probe: Kubernetes stops routing traffic to the pod (but
+          # keeps it running) until this succeeds.
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: 8761
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 3
+
+          # Resource requests tell the scheduler how much to reserve for this pod.
+          # Limits are the hard cap — exceeding memory causes OOMKill.
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+
+          env:
+            - name: SPRING_PROFILES_ACTIVE
+              value: "docker"
+            - name: EUREKA_CLIENT_SERVICE_URL_DEFAULTZONE
+              valueFrom:
+                configMapKeyRef:
+                  name: ecommerce-config
+                  key: EUREKA_URL
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: eureka-server
+spec:
+  selector:
+    app: eureka-server
+  ports:
+    - port: 8761
+      targetPort: 8761
+  # ClusterIP (default) — only reachable inside the cluster.
+  # Change to LoadBalancer or add an Ingress if you need external access.
+  type: ClusterIP

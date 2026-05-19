@@ -1,0 +1,40 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared ConfigMap and Secret for all microservices.
+#
+# ConfigMap: non-sensitive environment config (URLs, feature flags)
+# Secret:    sensitive values (JWT secret, DB passwords)
+#
+# Reference in a Deployment:
+#   env:
+#     - name: EUREKA_URL
+#       valueFrom:
+#         configMapKeyRef:
+#           name: ecommerce-config
+#           key: EUREKA_URL
+#     - name: JWT_SECRET
+#       valueFrom:
+#         secretKeyRef:
+#           name: ecommerce-secrets
+#           key: JWT_SECRET
+# ─────────────────────────────────────────────────────────────────────────────
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ecommerce-config
+data:
+  EUREKA_URL: "http://eureka-server:8761/eureka/"
+  KAFKA_BOOTSTRAP_SERVERS: "kafka:29092"
+  ZIPKIN_ENDPOINT: "http://zipkin:9411/api/v2/spans"
+  SPRING_PROFILES_ACTIVE: "docker"
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ecommerce-secrets
+type: Opaque
+stringData:
+  # JWT secret — must match the value in user-service and api-gateway application.yml
+  # In production, manage this via a secrets manager (Vault, AWS Secrets Manager, etc.)
+  JWT_SECRET: "404E635266556A586E3272357538782F413F4428472B4B6250645367566B5970"

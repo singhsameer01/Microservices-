@@ -1,2 +1,153 @@
-# Write your CI/CD pipeline here.
-# See README.md at the project root for a plain-English explanation of every step.
+# ─────────────────────────────────────────────────────────────────────────────
+# CI/CD Pipeline — microservices-ecommerce
+#
+# Three jobs run in order: build → docker-build → deploy
+#
+# Required GitHub Secrets (Settings → Secrets and variables → Actions):
+#   DOCKER_USERNAME   — your Docker Hub username
+#   DOCKER_PASSWORD   — your Docker Hub access token (not your password)
+#   KUBECONFIG        — base64-encoded kubeconfig for your cluster
+#                       Generate with: base64 -w 0 ~/.kube/config
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+
+  # ── Job 1: Build & Test ────────────────────────────────────────────────────
+  # Runs for all 7 services in parallel (matrix strategy).
+  # Each service is compiled and tested independently — one service failing does
+  # not cancel the others.
+  build:
+    name: Build & Test — ${{ matrix.service }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false       # keep other matrix jobs running if one fails
+      matrix:
+        service:
+          - eureka-server
+          - api-gateway
+          - user-service
+          - product-service
+          - order-service
+          - payment-service
+          - notification-service
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: temurin
+          # Cache Maven dependencies per service to speed up subsequent runs
+          cache: maven
+
+      - name: Build (skip tests)
+        run: mvn -f ${{ matrix.service }}/pom.xml clean package -DskipTests -q
+
+      - name: Run tests
+        run: mvn -f ${{ matrix.service }}/pom.xml test
+
+  # ── Job 2: Build & Push Docker Images ─────────────────────────────────────
+  # Runs only on push to main/develop (not on pull requests).
+  # Builds each service's Docker image and pushes it to Docker Hub.
+  docker-build:
+    name: Docker — ${{ matrix.service }}
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name == 'push'
+
+    strategy:
+      fail-fast: false
+      matrix:
+        service:
+          - eureka-server
+          - api-gateway
+          - user-service
+          - product-service
+          - order-service
+          - payment-service
+          - notification-service
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push ${{ matrix.service }}
+        uses: docker/build-push-action@v5
+        with:
+          context: ./${{ matrix.service }}
+          file: ./${{ matrix.service }}/Dockerfile
+          push: true
+          # Tag with both the commit SHA (immutable) and "latest" (for docker-compose)
+          tags: |
+            ${{ secrets.DOCKER_USERNAME }}/${{ matrix.service }}:${{ github.sha }}
+            ${{ secrets.DOCKER_USERNAME }}/${{ matrix.service }}:latest
+          # BuildKit cache: reuse layers from previous builds (speeds up CI)
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+  # ── Job 3: Deploy to Kubernetes ────────────────────────────────────────────
+  # Runs only on push to main (not develop or PRs).
+  # Applies all k8s manifests — Kubernetes performs a rolling update for each service.
+  deploy:
+    name: Deploy to Kubernetes
+    runs-on: ubuntu-latest
+    needs: docker-build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBECONFIG }}" | base64 -d > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+
+      - name: Apply ConfigMap and Secrets
+        run: kubectl apply -f k8s/configmap.yml
+
+      - name: Deploy all services
+        run: kubectl apply -f k8s/
+
+      - name: Update image tags to commit SHA
+        # Force each deployment to use the exact image built in this run,
+        # not the "latest" tag which may not yet be pulled by Kubernetes.
+        run: |
+          SERVICES="eureka-server api-gateway user-service product-service order-service payment-service notification-service"
+          for svc in $SERVICES; do
+            kubectl set image deployment/$svc \
+              $svc=${{ secrets.DOCKER_USERNAME }}/$svc:${{ github.sha }} \
+              --record || true
+          done
+
+      - name: Wait for rollouts to complete
+        run: |
+          SERVICES="eureka-server api-gateway user-service product-service order-service payment-service notification-service"
+          for svc in $SERVICES; do
+            kubectl rollout status deployment/$svc --timeout=5m
+          done

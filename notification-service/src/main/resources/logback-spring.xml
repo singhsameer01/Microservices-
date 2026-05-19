@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  logback-spring.xml — Structured JSON logging for notification-service.
+
+  Uses logstash-logback-encoder to write every log line as a JSON object to stdout.
+  Each line includes automatic fields:
+    - @timestamp       ISO-8601 timestamp
+    - @version         logstash format version
+    - level            INFO / DEBUG / WARN / ERROR
+    - logger_name      fully-qualified class name
+    - message          log message text
+    - correlationId    set via MDC in NotificationConsumer (the orderId)
+
+  This format is consumed directly by log aggregation tools (ELK, Loki, etc.)
+  without any additional parsing configuration.
+-->
+<configuration>
+
+    <appender name="STDOUT_JSON" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+            <!-- Include MDC fields (e.g. correlationId) as top-level JSON fields -->
+            <includeMdc>true</includeMdc>
+            <!-- Use short class names to reduce log line length -->
+            <shortenedLoggerNameLength>36</shortenedLoggerNameLength>
+        </encoder>
+    </appender>
+
+    <!-- Root logger: INFO in production, DEBUG in dev (override via spring.profiles) -->
+    <root level="INFO">
+        <appender-ref ref="STDOUT_JSON" />
+    </root>
+
+    <!-- Verbose debug logging for this service's own code -->
+    <logger name="com.learn.notification" level="DEBUG" />
+
+    <!-- Reduce Kafka client noise -->
+    <logger name="org.apache.kafka" level="WARN" />
+
+</configuration>

@@ -1,2 +1,60 @@
-# Write your configuration here.
-# See notification-service/README.md for a plain-English explanation of every setting.
+# ─────────────────────────────────────────────────────────────────────────────
+# notification-service — application.yml
+#
+# Pure event consumer: listens on "order-placed" and "payment-processed" Kafka topics.
+# No HTTP API — all input comes from Kafka.
+# ─────────────────────────────────────────────────────────────────────────────
+
+server:
+  port: 8085
+
+spring:
+  application:
+    name: notification-service
+
+  # ── Kafka consumer config ──────────────────────────────────────────────────
+  kafka:
+    bootstrap-servers: localhost:9092
+    consumer:
+      group-id: notification-service-group
+      # Start from the earliest available offset when first joining a group —
+      # ensures no events are missed on initial startup
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      properties:
+        spring.json.trusted.packages: "com.learn.*"
+        # Map the producer's fully-qualified class names (sent in __TypeId__ header)
+        # to the local event record classes in this service's classpath
+        spring.json.type.mapping: "com.learn.order.event.OrderPlacedEvent:com.learn.notification.event.OrderPlacedEvent,com.learn.payment.event.PaymentProcessedEvent:com.learn.notification.event.PaymentProcessedEvent"
+
+# ── Eureka service discovery ──────────────────────────────────────────────────
+eureka:
+  client:
+    service-url:
+      defaultZone: http://localhost:8761/eureka/
+  instance:
+    prefer-ip-address: true
+
+# ── Distributed tracing (Zipkin) ──────────────────────────────────────────────
+management:
+  tracing:
+    sampling:
+      probability: 1.0             # sample 100% in dev
+  zipkin:
+    tracing:
+      endpoint: http://localhost:9411/api/v2/spans
+
+  endpoints:
+    web:
+      exposure:
+        include: health, info, metrics, prometheus
+  endpoint:
+    health:
+      show-details: always
+      probes:
+        enabled: true
+
+logging:
+  level:
+    com.learn.notification: DEBUG

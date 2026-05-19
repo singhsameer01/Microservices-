@@ -1,2 +1,77 @@
-# Write your configuration here.
-# See product-service/README.md for a plain-English explanation of every setting.
+# ─────────────────────────────────────────────────────────────────────────────
+# product-service — application.yml
+#
+# Clean CRUD service for the product catalog.
+# No Kafka or JWT here — products are read/written via REST.
+# ─────────────────────────────────────────────────────────────────────────────
+
+server:
+  port: 8082
+
+spring:
+  application:
+    name: product-service    # must match @FeignClient(name="product-service") in order-service
+
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          jwk-set-uri: http://localhost:8081/.well-known/jwks.json
+
+  # ── H2 in-memory database ─────────────────────────────────────────────────
+  datasource:
+    url: jdbc:h2:mem:productdb;DB_CLOSE_DELAY=-1
+    driver-class-name: org.h2.Driver
+    username: product-service
+    password: pass
+
+  jpa:
+    hibernate:
+      ddl-auto: create-drop
+    show-sql: true
+    properties:
+      hibernate:
+        format_sql: true
+
+  h2:
+    console:
+      enabled: true
+      path: /h2-console
+
+# ── OpenAPI / Swagger UI ──────────────────────────────────────────────────────
+springdoc:
+  api-docs:
+    path: /api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+
+# ── Eureka service discovery ──────────────────────────────────────────────────
+eureka:
+  client:
+    service-url:
+      defaultZone: http://localhost:8761/eureka/
+  instance:
+    prefer-ip-address: true
+
+# ── Actuator, Prometheus metrics, and health probes ───────────────────────────
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, info, metrics, prometheus
+  endpoint:
+    health:
+      show-details: always    # was at wrong level (missing 'health:' parent)
+      probes:
+        enabled: true         # exposes /actuator/health/liveness and /readiness
+  tracing:
+    sampling:
+      probability: 1.0        # 100% trace sampling in dev
+  zipkin:
+    tracing:
+      endpoint: http://localhost:9411/api/v2/spans
+
+logging:
+  level:
+    com.learn.product: DEBUG
+

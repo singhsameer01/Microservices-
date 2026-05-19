@@ -1,2 +1,114 @@
-# Write your configuration here.
-# See order-service/README.md for a plain-English explanation of every setting.
+# ─────────────────────────────────────────────────────────────────────────────
+# order-service — application.yml
+#
+# Orchestrates the order flow: validates products via Feign, initiates payment
+# via Feign (with a circuit breaker), persists orders, and publishes events to Kafka.
+# ─────────────────────────────────────────────────────────────────────────────
+
+server:
+  port: 8083
+
+spring:
+  application:
+    name: order-service          # must match @FeignClient(name="order-service") callers
+
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          jwk-set-uri: http://localhost:8081/.well-known/jwks.json
+
+  # ── H2 in-memory database (no external DB required for local dev) ──────────
+  datasource:
+    url: jdbc:h2:mem:orderdb;DB_CLOSE_DELAY=-1
+    driver-class-name: org.h2.Driver
+    username: order-service
+    password: pass
+
+  jpa:
+    hibernate:
+      ddl-auto: create-drop      # schema recreated on every restart
+    show-sql: true
+    properties:
+      hibernate:
+        format_sql: true
+
+  h2:
+    console:
+      enabled: true
+      path: /h2-console
+
+  # ── Kafka producer config ──────────────────────────────────────────────────
+  kafka:
+    bootstrap-servers: localhost:9092
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      # Events are serialised as JSON; Spring Kafka picks the correct serializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      # Include type information so consumers can deserialise to the correct class
+      properties:
+        spring.json.add.type.headers: true
+
+# ── OpenAPI / Swagger UI ──────────────────────────────────────────────────────
+springdoc:
+  api-docs:
+    path: /api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+
+# ── Eureka service discovery ──────────────────────────────────────────────────
+eureka:
+  client:
+    service-url:
+      # Feign resolves lb://product-service and lb://payment-service via this registry
+      defaultZone: http://localhost:8761/eureka/
+  instance:
+    prefer-ip-address: true       # register with IP instead of hostname
+
+# ── Resilience4j circuit breaker — wraps calls to payment-service ─────────────
+resilience4j:
+  circuitbreaker:
+    instances:
+      payment-service:
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: 10         # evaluate the last 10 calls
+        failure-rate-threshold: 50      # open circuit when ≥50% of calls fail
+        wait-duration-in-open-state: 10s
+        permitted-number-of-calls-in-half-open-state: 3
+        minimum-number-of-calls: 5      # don't trip until at least 5 calls seen
+
+# ── Enable Feign circuit breaker integration ──────────────────────────────────
+feign:
+  circuitbreaker:
+    enabled: true
+
+# ── Distributed tracing (Zipkin) ──────────────────────────────────────────────
+management:
+  tracing:
+    sampling:
+      probability: 1.0             # sample 100% of requests in dev
+  zipkin:
+    tracing:
+      endpoint: http://localhost:9411/api/v2/spans
+
+  # ── Actuator endpoints ─────────────────────────────────────────────────────
+  endpoints:
+    web:
+      exposure:
+        include: health, info, metrics, prometheus, circuitbreakers
+  endpoint:
+    health:
+      show-details: always
+      probes:
+        enabled: true            # exposes /actuator/health/liveness and /readiness
+
+# ── Topic names — referenced by @Value in event publishers ───────────────────
+app:
+  kafka:
+    topics:
+      order-placed: order-placed
+
+
+logging:
+  level:
+    com.learn.order: DEBUG
