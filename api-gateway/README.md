@@ -1,203 +1,140 @@
-# api-gateway
+# API Gateway
 
-**Port:** 8080
+The API Gateway is the **single entry point** for all client traffic. It routes requests to the correct downstream microservice, validates JWT tokens, enforces rate limiting, and handles CORS — all before a request ever reaches a business service.
 
-## Purpose
-Single entry point for all client traffic. Routes requests to downstream services, enforces authentication, and handles cross-cutting concerns.
+- **Port:** `8080`
+- **Stack:** Spring Cloud Gateway (WebFlux/reactive — not Spring MVC)
 
-## What Needs to Be Here
+---
+
+## What It Does
 
 ### Routing
-- Routes exist for: user-service, product-service, order-service, payment-service
-- Routing uses service names (not hardcoded IPs) via the Eureka registry
 
-### Authentication
-- A filter that validates JWT tokens on every incoming request
-- Unauthenticated paths: `/api/v1/auth/**`
-- Requests with missing or invalid tokens are rejected with 401
-- Valid token → downstream service receives the authenticated user info as a header
+All routes are declared in `application.yml`. Each route matches on a path predicate and forwards to a service resolved via Eureka (`lb://` prefix triggers client-side load balancing):
 
-### Cross-Cutting
-- A global filter that logs every request (method, path, response status)
-- Rate limiting on order-service routes
+| Path Prefix | Forwards To | Special Filters |
+|-------------|-------------|-----------------|
+| `/api/v1/auth/**` | `lb://user-service` | `RequestRateLimiter` (10 req/s, burst 20) |
+| `/api/v1/users/**` | `lb://user-service` | — |
+| `/api/v1/products/**` | `lb://product-service` | — |
+| `/api/v1/orders/**` | `lb://order-service` | — |
+| `/api/v1/payments/**` | `lb://payment-service` | — |
 
-### Registration
-- This service registers itself with Eureka
+The `lb://` URI scheme instructs Spring Cloud LoadBalancer to look up live instances from the Eureka registry and distribute traffic round-robin.
 
----
+### JWT Validation
 
-## Configuration to Write (`application.yml`)
+The gateway is configured as an **OAuth2 Resource Server**. It fetches the RSA public key from `user-service` at `http://localhost:8081/.well-known/jwks.json` and uses it to validate every incoming JWT signature and expiry — without calling `user-service` on each request.
 
-> **How to use this section:** Every setting you need in `src/main/resources/application.yml` is explained below in plain English. Try to write each one yourself before looking at the answer — that is how you will actually learn it.
+Public paths bypassed by JWT validation:
+- `POST /api/v1/auth/**` (login, register, refresh)
+- `GET /actuator/**`
 
----
+All other requests require a valid `Authorization: Bearer <token>` header.
 
-### 1. Server Port
+### Rate Limiting
 
-**What is it?**
-The port the API Gateway opens on. All external traffic enters through this single door — no client ever talks directly to user-service, product-service, etc.
+The `/api/v1/auth/**` route has a `RequestRateLimiter` filter backed by **Redis**:
+- `replenishRate: 10` — refills 10 tokens per second
+- `burstCapacity: 20` — allows short bursts up to 20 requests
+- Key resolver: client IP address (`remoteAddrKeyResolver`)
 
-```yaml
-server:
-  port: ???   # hint: 8080
-```
+Requests exceeding the limit receive `HTTP 429 Too Many Requests`.
 
----
+### CORS
 
-### 2. Application Name
-
-**What is it?**
-The name this service registers under in Eureka. Other services and tools use this name to identify it.
-
-```yaml
-spring:
-  application:
-    name: ???
-```
+Global CORS policy permits all origins, methods, and headers — suitable for development. Tighten `allowedOrigins` for production.
 
 ---
 
-### 3. Route Rules (the most important config here)
+## Key Classes
 
-**What is it?**
-This is where you tell the gateway "when a request comes in matching this URL pattern, forward it to this service." This is the core job of an API gateway.
+### `SecurityConfig.java`
+Reactive (`@EnableWebFluxSecurity`) security config. Disables CSRF (stateless), defines the public path allowlist, configures the JWT resource server with the JWKS URI.
 
-Each route has:
-- **id** — a name you give the route (just a label)
-- **uri** — where to send the request. `lb://user-service` means "use Eureka's load balancer to find a service called `user-service`"
-- **predicates** — the condition that triggers this route (a URL pattern)
-
-You need four routes:
-
-| Route name       | URL patterns                          | Service to forward to |
-|-----------------|---------------------------------------|-----------------------|
-| user-service    | `/api/v1/users/**` and `/api/v1/auth/**` | `lb://user-service`  |
-| product-service | `/api/v1/products/**`                 | `lb://product-service`|
-| order-service   | `/api/v1/orders/**`                   | `lb://order-service`  |
-| payment-service | `/api/v1/payments/**`                 | `lb://payment-service`|
-
-```yaml
-spring:
-  cloud:
-    gateway:
-      routes:
-        - id: user-service
-          uri: lb://user-service
-          predicates:
-            - Path=/api/v1/users/**, /api/v1/auth/**
-
-        - id: product-service
-          uri: ???
-          predicates:
-            - Path: ???
-
-        # ... add routes for order-service and payment-service
-```
-
-> **Learn:** What does `lb://` mean? How does the gateway find the real IP of `user-service` using Eureka? What is a **predicate** in Spring Cloud Gateway?
+### `RateLimiterConfig.java`
+Exposes a `KeyResolver` bean that resolves rate-limit keys by client IP (`exchange.getRequest().getRemoteAddress().getAddress().getHostAddress()`).
 
 ---
 
-### 4. Register With Eureka
-
-**What is it?**
-The gateway needs to register itself with Eureka so it can look up the real addresses of downstream services. It also needs to tell Eureka where the Eureka server lives.
-
-```yaml
-eureka:
-  client:
-    service-url:
-      defaultZone: http://localhost:8761/eureka/
-  instance:
-    prefer-ip-address: true
-```
-
-> **Learn:** What does `prefer-ip-address: true` do? When would you want the IP address instead of the hostname?
-
----
-
-### 5. Expose Actuator Endpoints
-
-**What is it?**
-Same as other services, but the gateway also exposes a `gateway` endpoint that shows all active routes.
-
-```yaml
-management:
-  endpoints:
-    web:
-      exposure:
-        include: health, info, gateway
-  endpoint:
-    health:
-      show-details: always
-```
-
-> **Learn:** Try hitting `/actuator/gateway/routes` after the gateway starts. What do you see?
-
----
-
-## Topics to Learn
-
-- What is an **API Gateway** pattern and why is it used instead of calling each service directly?
-- What is **Spring Cloud Gateway** and how is it different from older Zuul gateway?
-- What does `lb://` mean in the route URI? (hint: Ribbon / Spring Cloud LoadBalancer)
-- What is a **predicate** vs a **filter** in Spring Cloud Gateway?
-- What is a **JWT** and how does a gateway validate one without a shared database?
-- What is a **GlobalFilter** and how do you write one?
-- What is **rate limiting** and how do you add it to a specific route?
-
----
-
-## Answer
-
-<details>
-<summary>Click to reveal the full application.yml (try first!)</summary>
+## Configuration (`application.yml`)
 
 ```yaml
 server:
   port: 8080
 
 spring:
-  application:
-    name: api-gateway
   cloud:
     gateway:
+      globalcors:
+        cors-configurations:
+          '[/**]':
+            allowedOrigins: "*"
+            allowedMethods: "*"
+            allowedHeaders: "*"
       routes:
-        - id: user-service
+        - id: user-service-auth
           uri: lb://user-service
           predicates:
-            - Path=/api/v1/users/**, /api/v1/auth/**
+            - Path=/api/v1/auth/**
+          filters:
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: 10
+                redis-rate-limiter.burstCapacity: 20
+                key-resolver: "#{@remoteAddrKeyResolver}"
 
-        - id: product-service
-          uri: lb://product-service
-          predicates:
-            - Path=/api/v1/products/**
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          jwk-set-uri: http://localhost:8081/.well-known/jwks.json
 
-        - id: order-service
-          uri: lb://order-service
-          predicates:
-            - Path=/api/v1/orders/**
-
-        - id: payment-service
-          uri: lb://payment-service
-          predicates:
-            - Path=/api/v1/payments/**
-
-eureka:
-  client:
-    service-url:
-      defaultZone: http://localhost:8761/eureka/
-  instance:
-    prefer-ip-address: true
-
-management:
-  endpoints:
-    web:
-      exposure:
-        include: health, info, gateway
-  endpoint:
-    health:
-      show-details: always
+  data:
+    redis:
+      host: localhost
+      port: 6379
 ```
 
-</details>
+---
+
+## Running
+
+```bash
+# Prerequisites: Eureka Server + Redis must be running
+mvn -f api-gateway/pom.xml spring-boot:run
+```
+
+---
+
+## Dependencies
+
+| Dependency | Purpose |
+|------------|---------|
+| `spring-cloud-starter-gateway` | WebFlux-based reverse proxy and routing |
+| `spring-cloud-starter-netflix-eureka-client` | Service discovery for `lb://` resolution |
+| `spring-boot-starter-security` + `oauth2-resource-server` | JWT validation |
+| `spring-boot-starter-data-redis-reactive` | Rate limiter token bucket storage |
+| `spring-boot-starter-actuator` | Health, metrics, prometheus endpoints |
+
+---
+
+## Role in the Platform
+
+```
+Client (browser / mobile / curl)
+    │
+    │  HTTP :8080
+    ▼
+API Gateway
+    ├── JWT validation (RSA public key from user-service JWKS)
+    ├── Rate limiting (Redis token bucket, per IP)
+    ├── CORS headers
+    │
+    ├── /api/v1/auth/**      → lb://user-service   :8081
+    ├── /api/v1/users/**     → lb://user-service   :8081
+    ├── /api/v1/products/**  → lb://product-service :8082
+    ├── /api/v1/orders/**    → lb://order-service   :8083
+    └── /api/v1/payments/**  → lb://payment-service :8084
+```

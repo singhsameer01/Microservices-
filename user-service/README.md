@@ -1,297 +1,187 @@
-# user-service
+# User Service
 
-**Port:** 8081
+The User Service handles **authentication and user management** for the entire platform. It is the only service that issues JWT tokens — all other services simply validate those tokens using the public key this service exposes.
 
-## Purpose
-Manages user accounts and authentication. Issues JWT tokens consumed by the gateway and other services.
-
-## What Needs to Be Here
-
-### Data
-- A `User` entity with: id, username, email, password (hashed), role, createdAt
-- A `UserRepository` backed by its own H2 database (no shared DB with other services)
-
-### DTOs
-- `RegisterRequest` — input for registration (Java 17 record)
-- `LoginRequest` — input for login (Java 17 record)
-- `UserResponse` — output (never exposes the password)
-
-### API
-- `POST /api/v1/auth/register` — creates a new user, returns 201
-- `POST /api/v1/auth/login` — validates credentials, returns a JWT token
-- `GET /api/v1/users/{id}` — returns user info (requires authentication)
-- `GET /api/v1/users` — paginated user list (admin only)
-
-### Security
-- Passwords stored as BCrypt hashes
-- JWT token generation and validation
-- Stateless session (no server-side sessions)
-- Endpoints protected except `/api/v1/auth/**`
-- Admin-only endpoints enforced at method level
-
-### Documentation
-- All endpoints documented with OpenAPI/Swagger
-- Swagger UI accessible and testable with JWT bearer auth
-
-### Error Handling
-- Duplicate username/email → 409
-- Invalid input → 400 with field-level errors
-- User not found → 404
-
-### Registration
-- Registers itself with Eureka
+- **Port:** `8081`
+- **Swagger UI:** [http://localhost:8081/swagger-ui.html](http://localhost:8081/swagger-ui.html)
+- **H2 Console:** [http://localhost:8081/h2-console](http://localhost:8081/h2-console) (JDBC URL: `jdbc:h2:mem:userdb`)
 
 ---
 
-## Configuration to Write (`application.yml`)
+## What It Does
 
-> **How to use this section:** Every setting you need in `src/main/resources/application.yml` is explained below in plain English. Try to write each one yourself before looking at the answer.
+### Authentication Flow
 
----
-
-### 1. Server Port and Application Name
-
-**What is it?**
-The port this service runs on. `8081` is the convention for user-service in this project. The application name is what appears in Eureka's registry and in log output.
-
-```yaml
-server:
-  port: ???
-
-spring:
-  application:
-    name: ???
+```
+Client                          user-service
+  │                                 │
+  │  POST /api/v1/auth/register     │
+  │ ──────────────────────────────► │  BCrypt-hash password, save User
+  │ ◄────────────────────────────── │  201 UserResponse
+  │                                 │
+  │  POST /api/v1/auth/login        │
+  │ ──────────────────────────────► │  AuthenticationManager.authenticate()
+  │                                 │  generate RSA-signed JWT (15 min)
+  │                                 │  generate refresh token UUID (7 days)
+  │ ◄────────────────────────────── │  AuthResponse { accessToken, refreshToken }
+  │                                 │
+  │  POST /api/v1/auth/refresh      │
+  │ ──────────────────────────────► │  validate refresh token, revoke old
+  │ ◄────────────────────────────── │  new accessToken + new refreshToken (rotation)
+  │                                 │
+  │  POST /api/v1/auth/logout       │
+  │ ──────────────────────────────► │  revoke refresh token
+  │ ◄────────────────────────────── │  200 OK  (access token expires naturally)
 ```
 
----
+### Token Architecture
 
-### 2. In-Memory Database (H2)
+Tokens are **RSA-2048 signed** (RS256). The service generates a new key pair **in memory** on every startup — meaning all tokens are invalidated on restart in development.
 
-**What is it?**
-Instead of installing a real database like MySQL or PostgreSQL, you use H2 — a tiny database that lives entirely in your computer's memory. It starts fresh every time the app starts and disappears when it stops. Perfect for learning.
+- The private key signs new JWTs (`JwtEncoder` + NimbusJWT)
+- The public key is exposed at `GET /.well-known/jwks.json` as a JWKS document
+- All other services (`api-gateway`, `product-service`, `order-service`, `payment-service`) configure `jwk-set-uri` pointing to this endpoint and validate tokens locally — zero round-trips to user-service per request
 
-- **url** — the connection string. `jdbc:h2:mem:userdb` means "use an in-memory H2 database named `userdb`". The `;DB_CLOSE_DELAY=-1` part keeps it alive as long as the app runs.
-- **driver-class-name** — the Java class H2 uses to handle database connections
-- **username / password** — H2's default credentials are `sa` with no password
-
-```yaml
-spring:
-  datasource:
-    url: jdbc:h2:mem:userdb;DB_CLOSE_DELAY=-1
-    driver-class-name: org.h2.Driver
-    username: sa
-    password:
+JWT claims:
+```json
+{
+  "iss": "user-service",
+  "sub": "<username>",
+  "role": "ROLE_USER",
+  "iat": ...,
+  "exp": ...   // now + 15 minutes
+}
 ```
 
-> **Learn:** What is JDBC? What is a "driver class"? Why does each microservice have its own separate database (this is the Database-per-Service pattern)?
+### Refresh Token Rotation
+
+Refresh tokens are stored in the `refresh_tokens` table (UUID, 7-day expiry, revocation flag). On each `/refresh` call:
+1. Old token is validated (not expired, not revoked)
+2. All existing tokens for that user are revoked (single-session semantics)
+3. A new access token + refresh token pair is issued
+
+This means a stolen refresh token can only be used once — the next legitimate use invalidates it.
 
 ---
 
-### 3. JPA / Hibernate Settings
+## REST API
 
-**What is it?**
-JPA (Java Persistence API) is the standard way to talk to databases in Java. Hibernate is the most popular implementation. These settings control how it behaves.
+### Auth Endpoints (`/api/v1/auth`)
 
-- **ddl-auto: create-drop** — when the app starts, automatically create all database tables from your Java entities. When it stops, drop (delete) everything. Great for development, never use in production.
-- **show-sql: true** — print every SQL query to the console. Helps you understand what Hibernate is doing under the hood.
-- **format_sql: true** — make the printed SQL readable (with line breaks and indentation)
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `POST` | `/register` | None | Create new user account |
+| `POST` | `/login` | None | Authenticate, receive tokens |
+| `POST` | `/refresh` | None | Rotate refresh token |
+| `POST` | `/logout` | Bearer token | Revoke refresh token |
 
-```yaml
-spring:
-  jpa:
-    hibernate:
-      ddl-auto: create-drop
-    show-sql: true
-    properties:
-      hibernate:
-        format_sql: true
+**Register request:**
+```json
+{ "username": "alice", "email": "alice@example.com", "password": "secret123" }
 ```
 
-> **Learn:** What are the other `ddl-auto` options (`validate`, `update`, `none`)? Why would you never use `create-drop` in a real production database?
-
----
-
-### 4. H2 Console (Database Browser)
-
-**What is it?**
-H2 comes with a built-in web UI that lets you browse your in-memory database like a mini SQL client in your browser. Enabling this makes it accessible at `http://localhost:8081/h2-console`.
-
-```yaml
-spring:
-  h2:
-    console:
-      enabled: true
-      path: /h2-console
+**Login response:**
+```json
+{
+  "accessToken": "<JWT>",
+  "refreshToken": "<UUID>",
+  "username": "alice",
+  "role": "ROLE_USER"
+}
 ```
 
-> **Learn:** Open `http://localhost:8081/h2-console` after starting the service. Connect using the JDBC URL, username, and password from your datasource config. Browse the tables that Hibernate created from your entities.
+### User Endpoints (`/api/v1/users`) — requires JWT
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/{id}` | Get user by ID |
+| `GET` | `/` | Paginated list of all users |
+
+### JWKS Endpoint
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/.well-known/jwks.json` | RSA public key for token verification |
 
 ---
 
-### 5. Swagger / OpenAPI Documentation
+## Database Schema
 
-**What is it?**
-SpringDoc automatically generates interactive API documentation from your code. This lets you test your endpoints in a browser without needing Postman.
+### `users`
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | BIGINT | Auto-generated PK |
+| `username` | VARCHAR | Unique |
+| `email` | VARCHAR | Unique |
+| `password` | VARCHAR | BCrypt hashed (strength 10) |
+| `role` | VARCHAR | Default `ROLE_USER` |
+| `created_at` | TIMESTAMP | Immutable, set on insert |
 
-- `/api-docs` — the raw JSON description of your API (machine-readable)
-- `/swagger-ui.html` — the human-friendly interactive UI
-
-```yaml
-springdoc:
-  api-docs:
-    path: /api-docs
-  swagger-ui:
-    path: /swagger-ui.html
-```
-
-> **Learn:** Start the service, open `http://localhost:8081/swagger-ui.html`. Try calling the register and login endpoints from there.
-
----
-
-### 6. JWT Secret and Expiration
-
-**What is it?**
-JWT (JSON Web Token) is how this service proves that a user is who they say they are. The secret is a secret key used to sign and verify tokens — think of it as a password that only your server knows.
-
-- **secret** — a long hex string used to sign JWTs. This exact same secret must also be in api-gateway (that is how the gateway can verify tokens without calling user-service)
-- **expiration** — how long (in milliseconds) a token stays valid. `86400000` = 24 hours (24 × 60 × 60 × 1000)
-
-```yaml
-jwt:
-  secret: 404E635266556A586E3272357538782F413F4428472B4B6250645367566B5970
-  expiration: 86400000
-```
-
-> **Learn:** What is a JWT? What are the three parts (header, payload, signature)? Why must the same secret be in both user-service AND api-gateway? What happens when a token expires?
+### `refresh_tokens`
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | BIGINT | Auto-generated PK |
+| `token` | VARCHAR | UUID, unique |
+| `user_id` | BIGINT | FK → users |
+| `expires_at` | TIMESTAMP | 7 days from creation |
+| `revoked` | BOOLEAN | Default false |
 
 ---
 
-### 7. Register With Eureka
+## Key Classes
 
-**What is it?**
-This service needs to announce itself to the Eureka registry so the API gateway can find and route traffic to it.
-
-```yaml
-eureka:
-  client:
-    service-url:
-      defaultZone: http://localhost:8761/eureka/
-  instance:
-    prefer-ip-address: true
-```
-
----
-
-### 8. Expose Actuator Endpoints (with Prometheus)
-
-**What is it?**
-This service exposes more actuator endpoints than eureka-server because we want to collect metrics from it.
-
-- `health` — is the service up?
-- `info` — app metadata
-- `metrics` — internal counters (requests processed, memory used, etc.)
-- `prometheus` — same metrics but in a format Prometheus can scrape
-
-```yaml
-management:
-  endpoints:
-    web:
-      exposure:
-        include: health, info, metrics, prometheus
-  endpoint:
-    health:
-      show-details: always
-```
-
-> **Learn:** Open `http://localhost:8081/actuator/prometheus` after starting. What do you see? This is what Prometheus reads every few seconds to collect metrics.
+| Class | Package | Role |
+|-------|---------|------|
+| `AuthController` | `controller` | Login, register, refresh, logout endpoints |
+| `UserController` | `controller` | User lookup endpoints |
+| `JwksController` | `controller` | Serves RSA public key as JWKS |
+| `UserService` | `service` | User CRUD, password encoding |
+| `RefreshTokenService` | `service` | Token lifecycle management |
+| `RsaKeyConfig` | `config` | Generates RSA key pair, beans for JwtEncoder/JwtDecoder |
+| `JwtUtil` | `config` | Builds and signs JWT claims |
+| `SecurityConfig` | `security` | HTTP security rules, stateless sessions |
+| `UserDetailsServiceImpl` | `security` | Loads user from DB for Spring Security |
 
 ---
 
-### 9. Logging Level
-
-**What is it?**
-Controls how much log output you see in the console. `DEBUG` is very verbose — it prints everything, including SQL queries and internal method calls. Good for learning, noisy in production.
-
-```yaml
-logging:
-  level:
-    com.learn.user: DEBUG
-```
-
-> **Learn:** What are the log levels in order from most to least verbose: TRACE, DEBUG, INFO, WARN, ERROR? What level would you use in production?
-
----
-
-## Topics to Learn
-
-- What is **JPA** and how does it map Java objects to database tables?
-- What is **Hibernate** and how is it related to JPA?
-- What is a **JWT** (JSON Web Token) and how does it work?
-- What is **BCrypt** and why is it used for passwords instead of MD5 or SHA?
-- What is the **Database-per-Service** pattern and why does each microservice need its own DB?
-- What is **Spring Security** and how do you configure it for stateless JWT auth?
-- What is **OpenAPI/Swagger** and how does SpringDoc generate it automatically?
-
----
-
-## Answer
-
-<details>
-<summary>Click to reveal the full application.yml (try first!)</summary>
+## Configuration (`application.yml`)
 
 ```yaml
 server:
   port: 8081
 
 spring:
-  application:
-    name: user-service
   datasource:
     url: jdbc:h2:mem:userdb;DB_CLOSE_DELAY=-1
-    driver-class-name: org.h2.Driver
-    username: sa
-    password:
   jpa:
     hibernate:
       ddl-auto: create-drop
-    show-sql: true
-    properties:
-      hibernate:
-        format_sql: true
-  h2:
-    console:
-      enabled: true
-      path: /h2-console
-
-springdoc:
-  api-docs:
-    path: /api-docs
-  swagger-ui:
-    path: /swagger-ui.html
 
 jwt:
-  secret: 404E635266556A586E3272357538782F413F4428472B4B6250645367566B5970
-  expiration: 86400000
-
-eureka:
-  client:
-    service-url:
-      defaultZone: http://localhost:8761/eureka/
-  instance:
-    prefer-ip-address: true
-
-management:
-  endpoints:
-    web:
-      exposure:
-        include: health, info, metrics, prometheus
-  endpoint:
-    health:
-      show-details: always
-
-logging:
-  level:
-    com.learn.user: DEBUG
+  expiration: 900000              # 15 minutes in milliseconds
+  refresh-token-expiration-days: 7
 ```
 
-</details>
+---
+
+## Running
+
+```bash
+# Prerequisites: Eureka Server must be running
+mvn -f user-service/pom.xml spring-boot:run
+```
+
+---
+
+## Dependencies
+
+| Dependency | Purpose |
+|------------|---------|
+| `spring-boot-starter-web` | REST controllers |
+| `spring-boot-starter-data-jpa` + `h2` | User and token persistence |
+| `spring-boot-starter-security` | Authentication, BCrypt |
+| `spring-boot-starter-oauth2-resource-server` | RSA JWT encoding/decoding (Nimbus) |
+| `spring-boot-starter-validation` | Request body validation (`@Valid`) |
+| `springdoc-openapi-starter-webmvc-ui` | Swagger UI |
+| `spring-cloud-starter-netflix-eureka-client` | Service registration |
+| `micrometer-registry-prometheus` | Prometheus metrics |

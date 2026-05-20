@@ -1,189 +1,209 @@
-# notification-service
+# Notification Service
 
-**Port:** 8085
+The Notification Service is a **pure Kafka consumer** — it has no REST API for business operations. It listens to both `order-placed` and `payment-processed` topics and sends notifications (currently structured log output; designed to be replaced with real email/SMS via Spring Mail).
 
-## Purpose
-Reacts to system events and sends notifications (email/log). Pure event consumer — no REST API for business operations.
-
-## What Needs to Be Here
-
-### Kafka Consumers
-- Listens on topic `order-placed` → sends order confirmation notification
-- Listens on topic `payment-processed` → sends payment receipt notification
-- Both consumers use manual offset commit
-- Failed messages go to a Dead Letter Topic
-
-### Notification Logic
-- A `NotificationService` that handles the notification action (log to console initially, wire real email later)
-
-### Observability
-- Structured JSON logging (every log line is valid JSON)
-- Each log entry includes: timestamp, level, service name, traceId, spanId, correlationId
-- A correlationId is extracted from the Kafka message and attached to logs for the entire processing span
-- Distributed traces sent to Zipkin
-
-### Registration
-- Registers itself with Eureka
+- **Port:** `8085` (Actuator and Eureka registration only — no business HTTP endpoints)
 
 ---
 
-## Configuration to Write (`application.yml`)
+## What It Does
 
-> **How to use this section:** Notification-service has the simplest configuration — no database, no circuit breaker. It only needs Kafka and Eureka. Try to write it yourself before revealing the answer.
+### Event Consumption
+
+```
+order-service  ──Kafka──►  order-placed topic
+                                │
+                                ▼
+                     NotificationConsumer.handleOrderPlaced()
+                                │
+                                ▼
+                     NotificationService.sendOrderConfirmation()
+                                │
+                                ▼
+                     Structured log: "Order confirmation for customer X, order Y"
+
+payment-service ──Kafka──►  payment-processed topic
+                                │
+                                ▼
+                     NotificationConsumer.handlePaymentProcessed()
+                                │
+                                ▼
+                     NotificationService.sendPaymentReceipt()
+                                │
+                                ▼
+                     Structured log: "Payment receipt for customer X, order Y, status SUCCESS"
+```
+
+### Structured Logging with Correlation
+
+Every log entry for a notification is tagged with a `correlationId` in the MDC (Mapped Diagnostic Context):
+
+```java
+MDC.put("correlationId", "order-" + orderId);
+// ... log the notification ...
+MDC.clear();   // always cleared in finally block
+```
+
+This correlationId appears in every log line written during that handler invocation. Combined with the `traceId` and `spanId` from Micrometer/Zipkin, you can trace a single order event through all services in a distributed log aggregator like Kibana or Grafana Loki.
+
+Log output format (JSON via logstash-logback-encoder):
+```json
+{
+  "timestamp": "2024-01-15T10:30:02.123Z",
+  "level": "INFO",
+  "traceId": "abc123",
+  "spanId": "def456",
+  "correlationId": "order-42",
+  "message": "Sending order confirmation for customer user-123, order 42"
+}
+```
+
+### Manual Offset Acknowledgement
+
+Both listeners use `AckMode.MANUAL_IMMEDIATE`. The consumer only acknowledges a message **after** successfully processing it:
+
+```
+receive message
+    │
+    ├─ process (send notification)
+    ├─ acknowledgment.acknowledge()   ← offset committed to Kafka
+    └─ MDC.clear()
+```
+
+If processing throws an exception before `acknowledge()`, Kafka will redeliver the message. After 3 retries (1s backoff), failed messages are routed to `{topic}.DLT` by the `DefaultErrorHandler`.
+
+### Event Type Mapping
+
+`notification-service` defines its own copies of `OrderPlacedEvent` and `PaymentProcessedEvent` in its local `event` package. The Kafka consumer is configured with type mappings so the deserializer converts the incoming event class names from `com.learn.order.event.*` and `com.learn.payment.event.*` to the local `com.learn.notification.event.*` equivalents — avoiding a cross-service dependency on shared POJOs.
 
 ---
 
-### 1. Server Port and Application Name
+## Kafka Integration
 
-Port is `8085`. Even though this service has no REST API for business operations, it still runs an HTTP server (for the Actuator health endpoints and Eureka registration).
+### Consumed: `order-placed` topic
+- Consumer group: `notification-service-group`
+- Offset: `earliest`
+- Ack mode: `MANUAL_IMMEDIATE`
 
-```yaml
-server:
-  port: ???
+Event structure:
+```json
+{
+  "orderId": 42,
+  "customerId": "user-123",
+  "amount": 449.97,
+  "timestamp": "2024-01-15T10:30:00Z"
+}
+```
 
-spring:
-  application:
-    name: ???
+### Consumed: `payment-processed` topic
+- Same consumer group and ack settings
+
+Event structure:
+```json
+{
+  "paymentId": 7,
+  "orderId": 42,
+  "status": "SUCCESS",
+  "timestamp": "2024-01-15T10:30:01Z"
+}
+```
+
+### Dead Letter Topics
+Failed messages go to `order-placed.DLT` and `payment-processed.DLT` after 3 retries.
+
+---
+
+## Extending to Real Notifications
+
+The `NotificationService` is designed so you can swap out log statements for actual delivery:
+
+```java
+// Current implementation
+public void sendOrderConfirmation(String customerId, Long orderId) {
+    log.info("Sending order confirmation for customer {}, order {}", customerId, orderId);
+}
+
+// Replace with Spring Mail
+@Autowired JavaMailSender mailSender;
+
+public void sendOrderConfirmation(String customerId, Long orderId) {
+    SimpleMailMessage msg = new SimpleMailMessage();
+    msg.setTo(lookupEmail(customerId));
+    msg.setSubject("Order #" + orderId + " confirmed");
+    mailSender.send(msg);
+}
 ```
 
 ---
 
-### 2. Kafka Consumer Configuration
+## Key Classes
 
-**What is it?**
-Notification-service is a **pure consumer** — it only reads from Kafka, never writes. It listens to two topics:
-1. `order-placed` — published by order-service when an order is created
-2. `payment-processed` — published by payment-service after a payment is processed
-
-For each message received, it sends a notification (currently just a log message).
-
-- **group-id: notification-service-group** — this service's consumer group. If you scale notification-service to 3 instances, Kafka splits the messages between them.
-- **auto-offset-reset: earliest** — if connecting for the first time, read from the beginning of the topic
-- **key-deserializer / value-deserializer** — convert the raw bytes from Kafka back into Java objects
-- **trusted.packages** — only deserialize into classes from `com.learn.*` packages
-
-```yaml
-spring:
-  kafka:
-    bootstrap-servers: localhost:9092
-    consumer:
-      group-id: notification-service-group
-      auto-offset-reset: earliest
-      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
-      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
-      properties:
-        spring.json.trusted.packages: "com.learn.*"
-```
-
-> **Learn:** This service has no `producer` config — it only consumes. What would happen if you ran two copies of notification-service at the same time? Would a customer get two notifications, or just one? (hint: consumer groups)
+| Class | Package | Role |
+|-------|---------|------|
+| `NotificationConsumer` | `messaging` | `@KafkaListener` for both topics, MDC management |
+| `NotificationService` | `service` | Sends notifications (currently logs) |
+| `KafkaConfig` | `config` | Manual ack container factory, DLT error handler |
+| `OrderPlacedEvent` | `event` | Local copy of the order event record |
+| `PaymentProcessedEvent` | `event` | Local copy of the payment event record |
 
 ---
 
-### 3. Register With Eureka
-
-**What is it?**
-Even though nothing calls notification-service directly (it receives events from Kafka, not HTTP requests), it still registers with Eureka. This lets the Eureka dashboard show it as healthy and lets Zipkin correlate its traces with other services.
-
-```yaml
-eureka:
-  client:
-    service-url:
-      defaultZone: http://localhost:8761/eureka/
-  instance:
-    prefer-ip-address: true
-```
-
----
-
-### 4. Actuator Endpoints and Distributed Tracing
-
-**What is it?**
-Same pattern as order-service and payment-service. The `tracing.sampling.probability: 1.0` sends every trace to Zipkin so you can see the full journey from API Gateway → order-service → Kafka → notification-service in one timeline.
-
-```yaml
-management:
-  endpoints:
-    web:
-      exposure:
-        include: health, info, metrics
-  endpoint:
-    health:
-      show-details: always
-  tracing:
-    sampling:
-      probability: 1.0
-```
-
----
-
-### 5. Logging Level
-
-```yaml
-logging:
-  level:
-    com.learn.notification: DEBUG
-```
-
-> **Learn:** Notification-service is supposed to use **structured JSON logging** (each log line is valid JSON with fields like `traceId`, `spanId`, `correlationId`). This is done with a `logback-spring.xml` config file, not `application.yml`. Look up how to configure Logback with a JSON encoder (hint: Logstash encoder).
-
----
-
-## Topics to Learn
-
-- What is **structured logging** and why is it better than plain text logs in a microservices system?
-- What is a **traceId** and a **spanId** in distributed tracing?
-- What is a **correlationId** and how do you pass it through a Kafka message?
-- Why does notification-service use **manual offset commit** instead of auto-commit?
-- What is a **Dead Letter Topic** and how do you configure one in Spring Kafka?
-- How would you replace the console log with a real email notification? (hint: Spring Mail / JavaMailSender)
-- What is **KEDA** (Kubernetes Event Driven Autoscaling) and how could it scale notification-service based on Kafka lag?
-
----
-
-## Answer
-
-<details>
-<summary>Click to reveal the full application.yml (try first!)</summary>
+## Configuration (`application.yml`)
 
 ```yaml
 server:
   port: 8085
 
 spring:
-  application:
-    name: notification-service
   kafka:
-    bootstrap-servers: localhost:9092
     consumer:
       group-id: notification-service-group
       auto-offset-reset: earliest
-      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
-      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      enable-auto-commit: false
       properties:
-        spring.json.trusted.packages: "com.learn.*"
-
-eureka:
-  client:
-    service-url:
-      defaultZone: http://localhost:8761/eureka/
-  instance:
-    prefer-ip-address: true
-
-management:
-  endpoints:
-    web:
-      exposure:
-        include: health, info, metrics
-  endpoint:
-    health:
-      show-details: always
-  tracing:
-    sampling:
-      probability: 1.0
-
-logging:
-  level:
-    com.learn.notification: DEBUG
+        spring.deserializer.value.delegate.class: org.springframework.kafka.support.serializer.JsonDeserializer
+        spring.json.trusted.packages: com.learn.notification.event
+        spring.json.type.mapping: >
+          com.learn.order.event.OrderPlacedEvent:com.learn.notification.event.OrderPlacedEvent,
+          com.learn.payment.event.PaymentProcessedEvent:com.learn.notification.event.PaymentProcessedEvent
+    listener:
+      ack-mode: manual_immediate
 ```
 
-</details>
+---
+
+## Running
+
+```bash
+# Prerequisites: Eureka + Kafka + Zookeeper must be running
+mvn -f notification-service/pom.xml spring-boot:run
+```
+
+---
+
+## Dependencies
+
+| Dependency | Purpose |
+|------------|---------|
+| `spring-boot-starter-web` | Actuator HTTP endpoints only |
+| `spring-kafka` | Kafka consumer |
+| `spring-cloud-starter-netflix-eureka-client` | Service registration for health monitoring |
+| `spring-boot-starter-actuator` | Health, metrics, prometheus |
+| `logstash-logback-encoder` | JSON-structured log output |
+| `micrometer-tracing-bridge-brave` + `zipkin-reporter-brave` | Distributed tracing (traceId in logs) |
+
+---
+
+## Role in the Platform
+
+```
+order-service ─── order-placed ─────────────────────────────┐
+                                                             │
+payment-service ─── payment-processed ──────────────────────┤
+                                                             │
+                                                             ▼
+                                               notification-service :8085
+                                                   │
+                                                   ├─ handleOrderPlaced()  → log / send email
+                                                   └─ handlePaymentProcessed() → log / send receipt
+```

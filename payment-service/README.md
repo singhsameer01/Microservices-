@@ -1,276 +1,199 @@
-# payment-service
+# Payment Service
 
-**Port:** 8084
+The Payment Service **processes payments** for orders. It consumes order events from Kafka (triggered by order-service), processes the payment via a simulated bank gateway (with its own circuit breaker), guarantees idempotency to survive Kafka redelivery, and publishes payment outcome events back to Kafka.
 
-## Purpose
-Processes payments. Consumes order events from Kafka and publishes payment result events. Also exposes a REST API for direct payment requests.
-
-## What Needs to Be Here
-
-### Data
-- A `Payment` entity with: id, orderId, customerId, amount (BigDecimal), status (PENDING / SUCCESS / FAILED), createdAt
-- Backed by its own H2 database
-
-### DTOs
-- `PaymentRequest` — input (Java 17 record): orderId, customerId, amount
-- `PaymentResponse` — output (Java 17 record): paymentId, orderId, status
-
-### API
-- `POST /api/v1/payments` → processes a payment, returns 201
-- `GET /api/v1/payments/{id}` → returns payment details
-- `GET /api/v1/payments/order/{orderId}` → returns payment for a given order
-
-### Kafka Consumer
-- Listens on topic `order-placed`
-- On receiving an `OrderPlacedEvent`, processes the payment automatically
-- Uses manual offset commit (at-least-once delivery guarantee)
-- Failed messages after max retries go to a Dead Letter Topic
-
-### Kafka Producer
-- After processing, publishes a `PaymentProcessedEvent` to topic `payment-processed`
-- `PaymentProcessedEvent` contains: paymentId, orderId, status, timestamp
-
-### Circuit Breaker
-- Calls to an external bank gateway (simulated) are protected by a circuit breaker
-
-### Error Handling
-- Order not found → 404
-- Payment already exists for order → 409
-- Invalid input → 400
-
-### Documentation
-- All endpoints documented with OpenAPI/Swagger
-
-### Registration
-- Registers itself with Eureka
+- **Port:** `8084`
+- **Swagger UI:** [http://localhost:8084/swagger-ui.html](http://localhost:8084/swagger-ui.html)
+- **H2 Console:** [http://localhost:8084/h2-console](http://localhost:8084/h2-console) (JDBC URL: `jdbc:h2:mem:paymentdb`)
 
 ---
 
-## Configuration to Write (`application.yml`)
+## What It Does
 
-> **How to use this section:** Every setting you need in `src/main/resources/application.yml` is explained below in plain English. Try to write each one yourself before looking at the answer.
+### Two Ways to Process a Payment
 
----
+Payments can be initiated in two ways:
 
-### 1. Server Port, Application Name, Database
+1. **Kafka (async):** `order-service` publishes an `OrderPlacedEvent` to the `order-placed` topic. `OrderPlacedConsumer` picks it up and calls `paymentService.process()`.
+2. **HTTP (sync):** `order-service` calls `POST /api/v1/payments` directly via Feign when the circuit is closed.
 
-Port is `8084`, database name is `paymentdb`. Same H2 in-memory setup as other services.
+Both paths call the same `PaymentService.process()` method, which includes idempotency checks.
 
-```yaml
-server:
-  port: ???
+### Payment Processing Flow
 
-spring:
-  application:
-    name: ???
-  datasource:
-    url: ???
-    driver-class-name: org.h2.Driver
-    username: sa
-    password:
-  jpa:
-    hibernate:
-      ddl-auto: create-drop
-    show-sql: true
-  h2:
-    console:
-      enabled: true
-      path: /h2-console
+```
+OrderPlacedConsumer.handleOrderPlaced(event)
+  │
+  ▼
+PaymentService.process(request)
+  │
+  ├─ 1. Idempotency check: if payment for this orderId already exists → throw
+  │      (PaymentAlreadyExistsException is non-retryable — consumer acknowledges and skips)
+  │
+  ├─ 2. Create Payment entity (status=PENDING, transactionId=new UUID)
+  │
+  ├─ 3. callBankGateway()  [@CircuitBreaker(name="bank-gateway")]
+  │       ├─ Simulates external bank API call → returns SUCCESS
+  │       └─ fallback: returns FAILED
+  │
+  ├─ 4. Set payment.status = SUCCESS or FAILED, save
+  │
+  └─ 5. Publish PaymentProcessedEvent to "payment-processed" Kafka topic
 ```
 
+### Idempotency
+
+Each payment record has a unique constraint on `orderId`. If Kafka redelivers the same `OrderPlacedEvent` (at-least-once delivery), the `process()` call throws `PaymentAlreadyExistsException` on the duplicate check. The Kafka consumer catches this, logs it, and acknowledges the message without reprocessing — preventing double-charging.
+
+### Bank Gateway Circuit Breaker
+
+`callBankGateway()` simulates calling an external bank API. It is wrapped in `@CircuitBreaker(name="bank-gateway")`:
+
+| Config | Value | Meaning |
+|--------|-------|---------|
+| `slidingWindowSize` | 5 | Track last 5 calls |
+| `failureRateThreshold` | 60% | Open after 3 failures in 5 calls |
+| `waitDurationInOpenState` | 15s | Stay open for 15s, then try half-open |
+| `minimumNumberOfCalls` | 3 | Need 3 calls before evaluating |
+
+When the circuit is open, `bankGatewayFallback()` returns `FAILED` immediately without calling the bank.
+
+### Dead Letter Topics
+
+Failed Kafka messages (after 3 retries with 1s backoff) are routed to `{topic}.DLT` (e.g., `order-placed.DLT`) by `DefaultErrorHandler` + `DeadLetterPublishingRecoverer`. This prevents poison messages from blocking the consumer indefinitely.
+
 ---
 
-### 2. Kafka — Consumer Configuration
+## REST API
 
-**What is it?**
-Payment-service listens to the `order-placed` topic. When order-service places an order and publishes an `OrderPlacedEvent`, payment-service receives it and automatically processes the payment.
+These endpoints are also called directly by `order-service` via Feign when operating synchronously.
 
-- **group-id: payment-service-group** — payment-service consumers share this group ID. Each message from `order-placed` goes to exactly one consumer in the group.
-- **auto-offset-reset: earliest** — if this is the first time the consumer connects, start from the beginning of the topic
-- **key-deserializer / value-deserializer** — convert bytes from Kafka back into Java objects
-- **trusted.packages** — only deserialize JSON into classes from `com.learn.*`
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/api/v1/payments/` | Process a payment → `201` |
+| `GET` | `/api/v1/payments/{id}` | Get payment by ID |
+| `GET` | `/api/v1/payments/order/{orderId}` | Get payment for a specific order |
 
-```yaml
-spring:
-  kafka:
-    bootstrap-servers: localhost:9092
-    consumer:
-      group-id: payment-service-group
-      auto-offset-reset: earliest
-      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
-      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
-      properties:
-        spring.json.trusted.packages: "com.learn.*"
+**Request body:**
+```json
+{
+  "orderId": 42,
+  "customerId": "user-123",
+  "amount": 449.97
+}
 ```
 
-> **Learn:** What is a **consumer group offset**? What does "at-least-once delivery" mean and why could you receive the same message twice? What is a **Dead Letter Topic**?
-
----
-
-### 3. Kafka — Producer Configuration
-
-**What is it?**
-After processing a payment, payment-service publishes a `PaymentProcessedEvent` to the `payment-processed` topic. Notification-service listens to this topic to send receipts.
-
-```yaml
-spring:
-  kafka:
-    producer:
-      key-serializer: org.apache.kafka.common.serialization.StringSerializer
-      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+**Response:**
+```json
+{
+  "id": 7,
+  "orderId": 42,
+  "customerId": "user-123",
+  "amount": 449.97,
+  "status": "SUCCESS",
+  "transactionId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+  "createdAt": "2024-01-15T10:30:01Z"
+}
 ```
 
+**Payment statuses:** `PENDING` → `SUCCESS` or `FAILED`
+
 ---
 
-### 4. Circuit Breaker for Bank Gateway
+## Database Schema
 
-**What is it?**
-Payment-service simulates calling an external bank to process the charge. This external call could fail or be slow. The circuit breaker protects the service — if the bank gateway is down, the circuit opens and payments fail fast instead of hanging.
+### `payments`
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | BIGINT | Auto-generated PK |
+| `order_id` | BIGINT | Unique — enforces idempotency |
+| `customer_id` | VARCHAR | |
+| `amount` | DECIMAL | |
+| `status` | VARCHAR | PENDING / SUCCESS / FAILED |
+| `transaction_id` | VARCHAR | UUID, unique, generated on construction |
+| `created_at` | TIMESTAMP | Immutable |
 
-Settings for the `bank-gateway` circuit breaker:
-- **sliding-window-size: 5** — look at the last 5 calls
-- **failure-rate-threshold: 60** — open the circuit if 60% of calls fail
-- **wait-duration-in-open-state: 15s** — wait 15 seconds before trying again
-- **minimum-number-of-calls: 3** — need at least 3 calls before making any health decision
+---
 
-```yaml
-resilience4j:
-  circuitbreaker:
-    instances:
-      bank-gateway:
-        sliding-window-size: 5
-        failure-rate-threshold: 60
-        wait-duration-in-open-state: 15s
-        minimum-number-of-calls: 3
+## Key Classes
+
+| Class | Package | Role |
+|-------|---------|------|
+| `PaymentController` | `controller` | REST endpoints |
+| `PaymentService` | `service` | Core payment logic, idempotency, bank call |
+| `OrderPlacedConsumer` | `messaging` | Kafka consumer for `order-placed` topic |
+| `PaymentEventPublisher` | `messaging` | Publishes `PaymentProcessedEvent` to Kafka |
+| `KafkaConfig` | `config` | Manual ack, DLT error handler, dead letter routing |
+| `SecurityConfig` | `security` | Stateless JWT resource server |
+
+---
+
+## Kafka Integration
+
+### Consumed: `order-placed` topic
+```json
+{
+  "orderId": 42,
+  "customerId": "user-123",
+  "amount": 449.97,
+  "timestamp": "2024-01-15T10:30:00Z"
+}
 ```
+Consumer group: `payment-service-group`. Offset: `earliest`. Manual acknowledgement (`AckMode.MANUAL_IMMEDIATE`).
 
-> **Learn:** Why is the threshold higher (60%) for bank-gateway than for order-service's payment-service circuit breaker (50%)? What is a **fallback** method in Resilience4j?
-
----
-
-### 5. Eureka, Swagger, Actuator, and Logging
-
-Same pattern as order-service. Also includes distributed tracing with Zipkin.
-
-```yaml
-springdoc:
-  api-docs:
-    path: /api-docs
-  swagger-ui:
-    path: /swagger-ui.html
-
-eureka:
-  client:
-    service-url:
-      defaultZone: http://localhost:8761/eureka/
-  instance:
-    prefer-ip-address: true
-
-management:
-  endpoints:
-    web:
-      exposure:
-        include: health, info, metrics, prometheus, circuitbreakers
-  endpoint:
-    health:
-      show-details: always
-  tracing:
-    sampling:
-      probability: 1.0
-
-logging:
-  level:
-    com.learn.payment: DEBUG
+### Published: `payment-processed` topic
+```json
+{
+  "paymentId": 7,
+  "orderId": 42,
+  "status": "SUCCESS",
+  "timestamp": "2024-01-15T10:30:01Z"
+}
 ```
+Message key: `orderId`.
 
 ---
 
-## Topics to Learn
-
-- What is **manual offset commit** in Kafka and why use it instead of auto-commit?
-- What is a **Dead Letter Topic (DLT)** and when does a message end up there?
-- What is **idempotency** and why should payment processing be idempotent? (hint: the 409 status code)
-- What is the difference between a Kafka **consumer** and a **listener** in Spring?
-- How does a circuit breaker in payment-service protect against a slow external bank API?
-- What is `@KafkaListener` annotation and how do you configure it?
-
----
-
-## Answer
-
-<details>
-<summary>Click to reveal the full application.yml (try first!)</summary>
+## Configuration (`application.yml`)
 
 ```yaml
 server:
   port: 8084
 
-spring:
-  application:
-    name: payment-service
-  datasource:
-    url: jdbc:h2:mem:paymentdb;DB_CLOSE_DELAY=-1
-    driver-class-name: org.h2.Driver
-    username: sa
-    password:
-  jpa:
-    hibernate:
-      ddl-auto: create-drop
-    show-sql: true
-  h2:
-    console:
-      enabled: true
-      path: /h2-console
-  kafka:
-    bootstrap-servers: localhost:9092
-    consumer:
-      group-id: payment-service-group
-      auto-offset-reset: earliest
-      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
-      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
-      properties:
-        spring.json.trusted.packages: "com.learn.*"
-    producer:
-      key-serializer: org.apache.kafka.common.serialization.StringSerializer
-      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
-
-springdoc:
-  api-docs:
-    path: /api-docs
-  swagger-ui:
-    path: /swagger-ui.html
-
-eureka:
-  client:
-    service-url:
-      defaultZone: http://localhost:8761/eureka/
-  instance:
-    prefer-ip-address: true
-
 resilience4j:
   circuitbreaker:
     instances:
       bank-gateway:
-        sliding-window-size: 5
-        failure-rate-threshold: 60
-        wait-duration-in-open-state: 15s
-        minimum-number-of-calls: 3
+        slidingWindowSize: 5
+        failureRateThreshold: 60
+        waitDurationInOpenState: 15s
+        minimumNumberOfCalls: 3
 
-management:
-  endpoints:
-    web:
-      exposure:
-        include: health, info, metrics, prometheus, circuitbreakers
-  endpoint:
-    health:
-      show-details: always
-  tracing:
-    sampling:
-      probability: 1.0
-
-logging:
-  level:
-    com.learn.payment: DEBUG
+app:
+  kafka:
+    topics:
+      order-placed: order-placed
+      payment-processed: payment-processed
 ```
 
-</details>
+---
+
+## Running
+
+```bash
+# Prerequisites: Eureka + Kafka + Zookeeper must be running
+mvn -f payment-service/pom.xml spring-boot:run
+```
+
+---
+
+## Dependencies
+
+| Dependency | Purpose |
+|------------|---------|
+| `spring-boot-starter-web` | REST API |
+| `spring-boot-starter-data-jpa` + `h2` | Payment persistence |
+| `spring-cloud-starter-circuitbreaker-resilience4j` | Bank gateway circuit breaker |
+| `spring-kafka` | Consumer and producer |
+| `spring-boot-starter-oauth2-resource-server` | JWT validation |
+| `micrometer-tracing-bridge-brave` + `zipkin-reporter-brave` | Distributed tracing |

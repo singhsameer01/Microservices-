@@ -1,347 +1,215 @@
-# order-service
+# Order Service
 
-**Port:** 8083
+The Order Service orchestrates the **order placement workflow**. It coordinates with product-service and payment-service via Feign clients, publishes events to Kafka using the Transactional Outbox Pattern, and wraps all downstream calls with Resilience4j circuit breakers.
 
-## Purpose
-Orchestrates order creation. Calls product-service and payment-service synchronously, then publishes an event to Kafka asynchronously.
-
-## What Needs to Be Here
-
-### Data
-- An `Order` entity with: id, customerId, status (PENDING / CONFIRMED / CANCELLED), totalAmount, createdAt
-- An `OrderItem` entity with: id, productId, quantity, price
-- `Order` has a one-to-many relationship with `OrderItem`
-- Both backed by their own H2 database
-
-### DTOs
-- `OrderRequest` — input (Java 17 record): customerId + list of items
-- `OrderItemDto` — (Java 17 record): productId + quantity
-- `OrderResponse` — output (Java 17 record)
-
-### API
-- `POST /api/v1/orders` → places order, returns 201
-- `GET /api/v1/orders/{id}` → returns order or 404
-- `GET /api/v1/orders/customer/{customerId}` → returns paginated list of customer orders
-
-### Inter-Service Calls (Synchronous)
-- A Feign client for product-service: fetches product details by ID
-- A Feign client for payment-service: processes payment
-- 404 from product-service maps to a domain-specific exception
-- Payment call is protected by a circuit breaker
-- Circuit breaker has a fallback that returns a safe degraded response
-- Product-service call is retried up to 3 times on transient failures
-
-### Event Publishing (Asynchronous)
-- After an order is saved, an `OrderPlacedEvent` is published to the `order-placed` Kafka topic
-- `OrderPlacedEvent` contains: orderId, customerId, totalAmount, timestamp
-- Event published using Outbox Pattern: event written to DB in same transaction as order, then polled and sent to Kafka
-
-### Error Handling
-- Payment circuit open → fallback response, order stays PENDING
-- Product not found → 404
-- Invalid input → 400
-
-### Documentation
-- All endpoints documented with OpenAPI/Swagger
-
-### Registration
-- Registers itself with Eureka
+- **Port:** `8083`
+- **Swagger UI:** [http://localhost:8083/swagger-ui.html](http://localhost:8083/swagger-ui.html)
+- **H2 Console:** [http://localhost:8083/h2-console](http://localhost:8083/h2-console) (JDBC URL: `jdbc:h2:mem:orderdb`)
 
 ---
 
-## Configuration to Write (`application.yml`)
+## What It Does
 
-> **How to use this section:** This service has the most complex configuration in the project. Take it one section at a time. Try to write each block yourself before revealing the answer at the bottom.
+### Order Placement Flow
 
----
-
-### 1. Server Port, Application Name, Database
-
-Same pattern as user-service and product-service. Port is `8083`, database name is `orderdb`.
-
-```yaml
-server:
-  port: ???
-
-spring:
-  application:
-    name: ???
-  datasource:
-    url: ???
-    driver-class-name: org.h2.Driver
-    username: sa
-    password:
-  jpa:
-    hibernate:
-      ddl-auto: create-drop
-    show-sql: true
-  h2:
-    console:
-      enabled: true
-      path: /h2-console
+```
+Client
+  │  POST /api/v1/orders
+  ▼
+OrderService.placeOrder()
+  │
+  ├─ 1. For each item: Feign GET /api/v1/products/{id}  → product-service
+  │                    (lookup price, name, validate product exists)
+  │
+  ├─ 2. Build Order entity (status=PENDING), persist to H2 (same transaction)
+  │
+  ├─ 3. Save OrderPlacedEvent to outbox table  (same DB transaction as step 2)
+  │
+  ├─ 4. PaymentProcessor.processPayment()  [circuit-breaker protected]
+  │      └─ Feign POST /api/v1/payments → payment-service
+  │           ├─ SUCCESS → order.status = CONFIRMED
+  │           └─ FAILURE / circuit open → paymentFallback() → order.status = CANCELLED
+  │
+  └─ 5. Return 201 OrderResponse
 ```
 
+Steps 2 and 3 commit atomically. Even if the service crashes after the DB commit but before Kafka publish, the `OutboxEventPublisher` will pick up and publish the event on the next poll cycle.
+
+### Transactional Outbox Pattern
+
+Instead of publishing directly to Kafka inside the business transaction, the service saves a serialized `OrderPlacedEvent` to the `outbox_events` table in the **same transaction** as the order. A separate scheduled component (`OutboxEventPublisher`) polls every 5 seconds for unpublished events, sends them to Kafka, then marks them published.
+
+This prevents the "dual write" problem: without the outbox, a crash between DB commit and Kafka publish would result in a lost event that no downstream consumer would ever process.
+
+### Resilience Patterns
+
+`PaymentProcessor` is a dedicated `@Service` bean (not part of `OrderService`) so that Spring AOP can intercept the Resilience4j annotations:
+
+| Annotation | Config | Behaviour |
+|------------|--------|-----------|
+| `@CircuitBreaker(name="payment-service")` | Window 10, 50% threshold, 10s wait | Opens after 5 failures in 10 calls |
+| `@Retry(name="payment-service")` | Max 3 attempts, 500ms, exponential x2 | Retries transient failures |
+| `@Bulkhead(name="payment-service")` | Max 10 concurrent, 100ms wait | Limits parallel calls to payment-service |
+
+All three are stacked on `processPayment()`. On any failure beyond retries, `paymentFallback()` is called, which sets order status to `CANCELLED`.
+
+### Token Relay
+
+`FeignConfig.tokenRelayInterceptor()` reads the `Authorization: Bearer <JWT>` from the incoming HTTP request and forwards it to all outgoing Feign calls. This means the user's token is propagated downstream to product-service and payment-service without re-authentication.
+
 ---
 
-### 2. Kafka — Producer Configuration
+## REST API
 
-**What is it?**
-Kafka is a message bus — a way for services to talk to each other without calling each other directly. A **producer** sends messages. Order-service will publish an `OrderPlacedEvent` to Kafka when an order is created.
+All endpoints require `Authorization: Bearer <JWT>`.
 
-- **bootstrap-servers** — the address of the Kafka broker (the central server that stores messages). When running locally with Docker Compose, it is at `localhost:9092`.
-- **key-serializer** — how to convert the message key (a String) to bytes so Kafka can store it
-- **value-serializer** — how to convert the message body (a Java object) to bytes. `JsonSerializer` converts it to JSON automatically.
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/api/v1/orders/` | Place a new order → `201` with `Location` header |
+| `GET` | `/api/v1/orders/{id}` | Get order by ID |
+| `GET` | `/api/v1/orders/customer/{customerId}` | Paginated orders for a customer |
 
-```yaml
-spring:
-  kafka:
-    bootstrap-servers: localhost:9092
-    producer:
-      key-serializer: org.apache.kafka.common.serialization.StringSerializer
-      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+**Place order request:**
+```json
+{
+  "customerId": "user-123",
+  "items": [
+    { "productId": 1, "quantity": 2 },
+    { "productId": 5, "quantity": 1 }
+  ]
+}
 ```
 
-> **Learn:** What is Kafka? What are topics, producers, and consumers? Why is async messaging useful instead of always calling services directly?
-
----
-
-### 3. Kafka — Consumer Configuration
-
-**What is it?**
-Even though order-service is mainly a producer, it can also consume messages. A **consumer** reads messages from Kafka topics.
-
-- **group-id** — all consumers with the same group ID share the work. If you have 3 instances of order-service, Kafka splits the messages between them. Each message is only processed once across the group.
-- **auto-offset-reset: earliest** — if this consumer has never read from this topic before, start from the very first message. The alternative is `latest` (only read new messages).
-- **key-deserializer / value-deserializer** — the reverse of serializers: convert bytes back to Java objects
-- **spring.json.trusted.packages** — for security, Spring only deserializes JSON into classes from trusted packages. `com.learn.*` means any class in your project is allowed.
-
-```yaml
-spring:
-  kafka:
-    consumer:
-      group-id: order-service-group
-      auto-offset-reset: earliest
-      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
-      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
-      properties:
-        spring.json.trusted.packages: "com.learn.*"
+**Response:**
+```json
+{
+  "id": 42,
+  "customerId": "user-123",
+  "status": "CONFIRMED",
+  "totalAmount": 449.97,
+  "items": [
+    { "productId": 1, "productName": "Headphones", "quantity": 2, "price": 149.99 },
+    { "productId": 5, "productName": "Keyboard", "quantity": 1, "price": 149.99 }
+  ],
+  "createdAt": "2024-01-15T10:30:00Z"
+}
 ```
 
+**Order statuses:** `PENDING` → `CONFIRMED` or `CANCELLED`
+
 ---
 
-### 4. Feign Client Timeouts
+## Database Schema
 
-**What is it?**
-When order-service calls product-service or payment-service using Feign (a REST client), it needs to know how long to wait before giving up.
+### `orders`
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | BIGINT | Auto-generated PK |
+| `customer_id` | VARCHAR | Reference to user |
+| `status` | VARCHAR | PENDING / CONFIRMED / CANCELLED |
+| `total_amount` | DECIMAL | Auto-calculated from items |
+| `created_at` | TIMESTAMP | Immutable |
 
-- **connect-timeout** — how many milliseconds to wait when trying to establish a connection (2000 ms = 2 seconds)
-- **read-timeout** — how many milliseconds to wait for the response once connected (5000 ms = 5 seconds)
+### `order_items`
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | BIGINT | PK |
+| `order_id` | BIGINT | FK → orders |
+| `product_id` | BIGINT | Product reference |
+| `product_name` | VARCHAR | Snapshot at order time |
+| `quantity` | INTEGER | |
+| `price` | DECIMAL | Snapshot at order time |
 
-```yaml
-feign:
-  client:
-    config:
-      default:
-        connect-timeout: 2000
-        read-timeout: 5000
+### `outbox_events`
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | BIGINT | PK |
+| `aggregate_type` | VARCHAR | e.g. `ORDER` |
+| `aggregate_id` | BIGINT | Order ID |
+| `event_type` | VARCHAR | e.g. `OrderPlacedEvent` |
+| `payload` | TEXT | JSON-serialized event |
+| `created_at` | TIMESTAMP | |
+| `published` | BOOLEAN | false until Kafka publish succeeds |
+
+---
+
+## Key Classes
+
+| Class | Package | Role |
+|-------|---------|------|
+| `OrderController` | `controller` | REST endpoints |
+| `OrderService` | `service` | Orchestration logic, outbox save |
+| `PaymentProcessor` | `service` | Resilience4j-wrapped payment call (separate bean for AOP) |
+| `ProductClient` | `client` | `@FeignClient(name="product-service")` |
+| `PaymentClient` | `client` | `@FeignClient(name="payment-service")` |
+| `FeignConfig` | `config` | Token relay interceptor, error decoder |
+| `OrderEventPublisher` | `messaging` | `KafkaTemplate` publisher |
+| `OutboxEventPublisher` | `messaging` | `@Scheduled` outbox poller |
+
+---
+
+## Kafka Events
+
+### Published: `order-placed` topic
+```json
+{
+  "orderId": 42,
+  "customerId": "user-123",
+  "totalAmount": 449.97,
+  "timestamp": "2024-01-15T10:30:00Z"
+}
 ```
+Message key: `orderId` (ensures all events for the same order go to the same partition, preserving order).
 
-> **Learn:** What is **OpenFeign**? How does it let you call another service's REST API as if it were a local Java method? What happens when the timeout is exceeded?
-
----
-
-### 5. Circuit Breaker (Resilience4j)
-
-**What is it?**
-A circuit breaker is a safety mechanism. Imagine order-service calls payment-service, but payment-service is down or very slow. Without a circuit breaker, order-service would hang waiting, and all incoming requests would pile up — eventually crashing order-service too.
-
-A circuit breaker monitors calls and "opens" (stops calling the failing service) when too many fail. After a wait period, it goes "half-open" and tries a few test calls. If those succeed, it closes again (normal operation).
-
-The settings below are for the `payment-service` circuit breaker inside order-service:
-
-- **sliding-window-size: 10** — look at the last 10 calls to decide if things are healthy
-- **minimum-number-of-calls: 5** — need at least 5 calls before making any health decision
-- **failure-rate-threshold: 50** — if 50% or more of the last 10 calls failed, open the circuit
-- **wait-duration-in-open-state: 10s** — wait 10 seconds in the open state before trying again
-- **permitted-number-of-calls-in-half-open-state: 3** — allow 3 test calls when half-open
-- **slow-call-rate-threshold: 50** — also consider a call a "failure" if it takes too long
-- **slow-call-duration-threshold: 2s** — "too long" means longer than 2 seconds
-
-```yaml
-resilience4j:
-  circuitbreaker:
-    instances:
-      payment-service:
-        register-health-indicator: true
-        sliding-window-size: 10
-        minimum-number-of-calls: 5
-        permitted-number-of-calls-in-half-open-state: 3
-        wait-duration-in-open-state: 10s
-        failure-rate-threshold: 50
-        slow-call-rate-threshold: 50
-        slow-call-duration-threshold: 2s
-```
-
-> **Learn:** What are the three states of a circuit breaker (Closed, Open, Half-Open)? What is a **fallback method**? What is the difference between a circuit breaker and a retry?
+Producer config: `acks=all`, `retries=3`, `enable.idempotence=true` — guarantees exactly-once delivery to Kafka.
 
 ---
 
-### 6. Eureka Registration
-
-Same as other services.
-
-```yaml
-eureka:
-  client:
-    service-url:
-      defaultZone: http://localhost:8761/eureka/
-  instance:
-    prefer-ip-address: true
-```
-
----
-
-### 7. Actuator with Tracing and Circuit Breaker Health
-
-This service also exposes circuit breaker health and distributed tracing.
-
-- **circuitbreakers** — exposes a `/actuator/circuitbreakers` endpoint showing circuit breaker state
-- **tracing.sampling.probability: 1.0** — send 100% of requests to Zipkin for distributed tracing (in production you might use 0.1 = 10% to reduce overhead)
-
-```yaml
-springdoc:
-  api-docs:
-    path: /api-docs
-  swagger-ui:
-    path: /swagger-ui.html
-
-management:
-  endpoints:
-    web:
-      exposure:
-        include: health, info, metrics, prometheus, circuitbreakers
-  endpoint:
-    health:
-      show-details: always
-  health:
-    circuitbreakers:
-      enabled: true
-  tracing:
-    sampling:
-      probability: 1.0
-
-logging:
-  level:
-    com.learn.order: DEBUG
-    feign: DEBUG
-```
-
-> **Learn:** What is **distributed tracing**? What is **Zipkin**? How does a trace flow from API Gateway → order-service → payment-service and appear in Zipkin as a single timeline?
-
----
-
-## Topics to Learn
-
-- What is **Apache Kafka** and how does it compare to a REST API call?
-- What is a **Kafka topic**, **partition**, **offset**, and **consumer group**?
-- What is the **Circuit Breaker pattern** and the three states (Closed / Open / Half-Open)?
-- What is **OpenFeign** and how do you annotate a Feign client interface?
-- What is the **Outbox Pattern** for reliable event publishing?
-- What is **distributed tracing** and how does Zipkin display it?
-- What is the difference between **at-least-once** and **exactly-once** message delivery?
-
----
-
-## Answer
-
-<details>
-<summary>Click to reveal the full application.yml (try first!)</summary>
+## Configuration (`application.yml`)
 
 ```yaml
 server:
   port: 8083
 
-spring:
-  application:
-    name: order-service
-  datasource:
-    url: jdbc:h2:mem:orderdb;DB_CLOSE_DELAY=-1
-    driver-class-name: org.h2.Driver
-    username: sa
-    password:
-  jpa:
-    hibernate:
-      ddl-auto: create-drop
-    show-sql: true
-  h2:
-    console:
-      enabled: true
-      path: /h2-console
-  kafka:
-    bootstrap-servers: localhost:9092
-    producer:
-      key-serializer: org.apache.kafka.common.serialization.StringSerializer
-      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
-    consumer:
-      group-id: order-service-group
-      auto-offset-reset: earliest
-      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
-      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
-      properties:
-        spring.json.trusted.packages: "com.learn.*"
-
-springdoc:
-  api-docs:
-    path: /api-docs
-  swagger-ui:
-    path: /swagger-ui.html
-
-eureka:
-  client:
-    service-url:
-      defaultZone: http://localhost:8761/eureka/
-  instance:
-    prefer-ip-address: true
-
 resilience4j:
   circuitbreaker:
     instances:
       payment-service:
-        register-health-indicator: true
-        sliding-window-size: 10
-        minimum-number-of-calls: 5
-        permitted-number-of-calls-in-half-open-state: 3
-        wait-duration-in-open-state: 10s
-        failure-rate-threshold: 50
-        slow-call-rate-threshold: 50
-        slow-call-duration-threshold: 2s
-
-feign:
-  client:
-    config:
-      default:
-        connect-timeout: 2000
-        read-timeout: 5000
-
-management:
-  endpoints:
-    web:
-      exposure:
-        include: health, info, metrics, prometheus, circuitbreakers
-  endpoint:
-    health:
-      show-details: always
-  health:
-    circuitbreakers:
-      enabled: true
-  tracing:
-    sampling:
-      probability: 1.0
-
-logging:
-  level:
-    com.learn.order: DEBUG
-    feign: DEBUG
+        slidingWindowSize: 10
+        failureRateThreshold: 50
+        waitDurationInOpenState: 10s
+        minimumNumberOfCalls: 5
+  retry:
+    instances:
+      payment-service:
+        maxAttempts: 3
+        waitDuration: 500ms
+        multiplier: 2
+  bulkhead:
+    instances:
+      payment-service:
+        maxConcurrentCalls: 10
+        maxWaitDuration: 100ms
 ```
 
-</details>
+---
+
+## Running
+
+```bash
+# Prerequisites: Eureka + Kafka + Zookeeper must be running
+mvn -f order-service/pom.xml spring-boot:run
+```
+
+---
+
+## Dependencies
+
+| Dependency | Purpose |
+|------------|---------|
+| `spring-cloud-starter-openfeign` | Declarative REST clients for product/payment service |
+| `spring-cloud-starter-circuitbreaker-resilience4j` | Circuit breaker, retry, bulkhead |
+| `spring-kafka` | Kafka producer (order events) |
+| `spring-boot-starter-data-jpa` + `h2` | Order and outbox persistence |
+| `spring-boot-starter-oauth2-resource-server` | JWT validation |
+| `micrometer-tracing-bridge-brave` + `zipkin-reporter-brave` | Distributed tracing |
